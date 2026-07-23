@@ -15,7 +15,7 @@ from google import genai
 from google.genai import types
 from google.genai.errors import APIError
 from groq import Groq
-from duckduckgo_search import DDGS
+from ddgs import DDGS
 
 torch.set_num_threads(2)
 
