@@ -2,3 +2,4 @@ streamlit
 sentence-transformers
 google-genai
 numpy
+groq
