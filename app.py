@@ -1,26 +1,36 @@
-import json
 import os
+# Streamlit Cloud'da PyTorch CPU kilitlenmesini önlemek için en başa ekliyoruz
+os.environ["OMP_NUM_THREADS"] = "2"
+os.environ["MKL_NUM_THREADS"] = "2"
+
+import json
 import re
 import numpy as np
 import streamlit as st
+import torch
 from sentence_transformers import SentenceTransformer
 from google import genai
 from google.genai import types
 
+torch.set_num_threads(2)
+
 # ---------------------------------------------------------------
-# 1. Streamlit Sayfa Yapılandırması
+# 1. Sayfa Yapılandırması ve Stiller
 # ---------------------------------------------------------------
 st.set_page_config(
     page_title="Hyprland Config Assistant",
-    page_icon="🤖",
-    layout="wide"
+    page_icon="⚡",
+    layout="wide",
+    initial_sidebar_state="expanded"
 )
 
-st.title("🤖 Hyprland RAG Asistanı")
-st.caption("Gelişmiş Tablo Parsing & Semantik Arama Destekli")
-
-# API Key yönetimi (Secrets veya Manuel Girdi)
-api_key = os.getenv("GEMINI_API_KEY")
+st.markdown("""
+<style>
+    .stApp { background-color: #0e1117; }
+    .main-header { font-size: 2rem; font-weight: 700; color: #58a6ff; margin-bottom: 0.2rem; }
+    .sub-header { font-size: 0.95rem; color: #8b949e; margin-bottom: 1.5rem; }
+</style>
+""", unsafe_allow_html=True)
 
 GEN_MODEL = "gemma-4-31b-it"
 EMBED_MODEL_NAME = "intfloat/multilingual-e5-large"
@@ -31,7 +41,24 @@ CHUNK_OVERLAP = 120
 SKIP_KEYWORDS = ["readme", "version-selector", "_index", "license"]
 
 # ---------------------------------------------------------------
-# 2. Önbelleğe Alınmış Yüklemeler (Aşırı Hız Sağlar)
+# 2. Sol Yan Panel (Sidebar)
+# ---------------------------------------------------------------
+with st.sidebar:
+    st.title("⚡ Hyprland RAG")
+    st.markdown("---")
+    
+    default_api_key = st.secrets.get("GEMINI_API_KEY", "AQ.Ab8RN6KQRjeo4QPLMhY_y7EG7e5mdOi5HRwVWgbolRh9mdxW_A")
+    api_key_input = st.text_input("Gemini API Key", value=default_api_key, type="password")
+    
+    top_k_slider = st.slider("Getirilecek Doküman (Top K)", min_value=3, max_value=20, value=10)
+    temp_slider = st.slider("Sıcaklık (Temperature)", min_value=0.0, max_value=1.0, value=0.3, step=0.1)
+    
+    st.markdown("---")
+    st.markdown("### 📊 Durum")
+    status_box = st.empty()
+
+# ---------------------------------------------------------------
+# 3. Önbelleğe Alınmış Yüklemeler (Sıfırdan Embed İşlemi YOK)
 # ---------------------------------------------------------------
 @st.cache_resource
 def get_gemini_client(key):
@@ -42,35 +69,26 @@ def load_embedder():
     return SentenceTransformer(EMBED_MODEL_NAME)
 
 @st.cache_data
-def load_dataset_and_embeddings():
-    embedder = load_embedder()
-    
-    # Dokümanları Hazırla
-    def parse_markdown_tables(text, topic):
+def load_data_and_cache():
+    # Doküman yapısını dataset'ten anında kur
+    def parse_tables(text):
         rows = []
-        lines = text.split("\n")
-        for line in lines:
+        for line in text.split("\n"):
             line = line.strip()
             if not line.startswith("|") or line.count("|") < 3:
                 continue
             cells = [c.strip() for c in line.strip("|").split("|")]
-            if all(re.fullmatch(r"[-: ]*", c) for c in cells):
-                continue
-            if cells and cells[0].lower() in ("name", "key", "setting"):
+            if all(re.fullmatch(r"[-: ]*", c) for c in cells) or (cells and cells[0].lower() in ("name", "key", "setting")):
                 continue
             if len(cells) >= 2 and cells[0]:
-                row_text = f"Ayar: {cells[0]}\n" + "\n".join(
-                    f"{h}: {v}" for h, v in zip(["Açıklama", "Tip", "Varsayılan"], cells[1:])
-                )
-                rows.append(row_text)
+                rows.append(f"Ayar: {cells[0]}\n" + "\n".join(f"{h}: {v}" for h, v in zip(["Açıklama", "Tip", "Varsayılan"], cells[1:])))
         return rows
 
     def chunk_text(text, size=CHUNK_SIZE, overlap=CHUNK_OVERLAP):
         chunks = []
         start = 0
         while start < len(text):
-            end = start + size
-            chunks.append(text[start:end])
+            chunks.append(text[start:start+size])
             start += size - overlap
         return chunks
 
@@ -83,173 +101,138 @@ def load_dataset_and_embeddings():
         if any(kw in topic.lower() for kw in SKIP_KEYWORDS):
             continue
 
-        table_rows = parse_markdown_tables(item["output"], topic)
-        for row in table_rows:
+        for row in parse_tables(item["output"]):
             documents.append({"topic": topic, "text": row, "is_table_row": True})
 
         for chunk in chunk_text(item["output"]):
-            if len(chunk.strip()) < 50:
-                continue
-            documents.append({"topic": topic, "text": chunk, "is_table_row": False})
+            if len(chunk.strip()) >= 50:
+                documents.append({"topic": topic, "text": chunk, "is_table_row": False})
 
-    # Cache veya Embed İşlemi
-    if os.path.exists(CACHE_PATH):
-        cache = np.load(CACHE_PATH, allow_pickle=True)
-        embeddings = cache["embeddings"]
-        cached_texts = cache["texts"]
-        if len(cached_texts) != len(documents) or list(cached_texts) != [d["text"] for d in documents]:
-            os.remove(CACHE_PATH)
-            embeddings = None
-    else:
-        embeddings = None
+    # npz Önbelleğini Doğrudan Yükle
+    if not os.path.exists(CACHE_PATH):
+        st.error(f"❌ '{CACHE_PATH}' dosyası bulunamadı! Lütfen repoya push'ladığından emin ol.")
+        st.stop()
 
-    if embeddings is None:
-        chunk_texts = ["passage: " + d["text"] for d in documents]
-        embeddings = embedder.encode(chunk_texts, show_progress_bar=False, convert_to_numpy=True)
-        embeddings = embeddings / np.linalg.norm(embeddings, axis=1, keepdims=True)
-        np.savez(CACHE_PATH, embeddings=embeddings, texts=np.array([d["text"] for d in documents], dtype=object))
+    cache = np.load(CACHE_PATH, allow_pickle=True)
+    embeddings = cache["embeddings"]
 
     return documents, embeddings
 
-# Baştan Yükle
-client = get_gemini_client(api_key)
-embedder = load_embedder()
-documents, embeddings = load_dataset_and_embeddings()
+# Model ve Verileri Yükle
+try:
+    client = get_gemini_client(api_key_input)
+    embedder = load_embedder()
+    documents, embeddings = load_data_and_cache()
+    status_box.success(f"✅ Hazır! ({len(embeddings)} embedding cache'den yüklendi)")
+except Exception as e:
+    status_box.error(f"Yükleme hatası: {e}")
+    st.stop()
 
 # ---------------------------------------------------------------
-# 3. Yardımcı Fonksiyonlar
+# 4. Arama Fonksiyonları
 # ---------------------------------------------------------------
 def expand_query(question):
-    prompt = f"""Aşağıdaki soru bir Hyprland (Wayland compositor) kullanıcısından geliyor.
-Bu soruyla ilgili olabilecek Hyprland config ayar adı/adlarını tahmin et
-(örn. border_size, gaps_in, snap.enabled gibi). Sadece olası ayar adlarını
-virgülle ayırarak İngilizce yaz, başka açıklama ekleme.
-
-Soru: {question}"""
+    prompt = f"Hyprland config sorusu: '{question}'. İlgili config parametrelerini İngilizce, virgülle ayırarak yaz (örn: border_size, gaps_in)."
     try:
-        response = client.models.generate_content(
-            model=GEN_MODEL,
-            contents=prompt,
-            config=types.GenerateContentConfig(temperature=0.2),
+        res = client.models.generate_content(
+            model=GEN_MODEL, 
+            contents=prompt, 
+            config=types.GenerateContentConfig(temperature=0.2)
         )
-        return [t.strip() for t in response.text.split(",") if t.strip()]
+        return [t.strip() for t in res.text.split(",") if t.strip()]
     except Exception:
         return []
 
-def extract_keywords(question, expanded_terms=None):
-    dotted = re.findall(r'\b[a-zA-Z_]+(?:\.[a-zA-Z_]+)+\b', question)
-    underscored = re.findall(r'\b[a-zA-Z]+_[a-zA-Z_]+\b', question)
-    keywords = set(dotted + underscored)
-
-    if expanded_terms:
-        for term in expanded_terms:
-            t_clean = term.strip().strip("`").strip()
-            if len(t_clean) > 2:
-                keywords.add(t_clean)
-
-    return list(keywords)
-
-def is_near_duplicate(text_a, text_b):
-    shorter, longer = sorted([text_a, text_b], key=len)
-    if not shorter:
-        return False
-    return shorter[:200] in longer or (len(shorter) > 30 and shorter[:100] in longer)
-
-def retrieve(question, top_k=10):
-    expanded_terms = expand_query(question)
-    q_text = "query: " + question + (" " + " ".join(expanded_terms) if expanded_terms else "")
+def retrieve(question, top_k):
+    expanded = expand_query(question)
+    q_text = "query: " + question + (" " + " ".join(expanded) if expanded else "")
     
+    # Sadece tek bir soru cümlesi embed edilir (Saliseler sürer)
     q_emb = embedder.encode([q_text], convert_to_numpy=True)[0]
     q_emb = q_emb / np.linalg.norm(q_emb)
     scores = embeddings @ q_emb
 
-    keywords = extract_keywords(question, expanded_terms)
+    keywords = set(re.findall(r'\b[a-zA-Z_]+(?:\.[a-zA-Z_]+)+\b', question) + re.findall(r'\b[a-zA-Z]+_[a-zA-Z_]+\b', question) + expanded)
+    
     exact_match_idx = []
     if keywords:
         for i, doc in enumerate(documents):
-            text_lower = doc["text"].lower()
-            for kw in keywords:
-                if re.search(r'\b' + re.escape(kw.lower()) + r'\b', text_lower):
-                    exact_match_idx.append(i)
-                    break
+            if any(re.search(r'\b' + re.escape(kw.lower()) + r'\b', doc["text"].lower()) for kw in keywords if len(kw) > 2):
+                exact_match_idx.append(i)
 
     exact_match_idx.sort(key=lambda i: scores[i], reverse=True)
-    exact_set = set(exact_match_idx)
-    remaining_idx = [i for i in np.argsort(scores)[::-1] if i not in exact_set]
-    candidate_idx = exact_match_idx + remaining_idx
+    candidate_idx = exact_match_idx + [i for i in np.argsort(scores)[::-1] if i not in set(exact_match_idx)]
 
     final_idx = []
     for i in candidate_idx:
         if len(final_idx) >= top_k:
             break
-        if not any(is_near_duplicate(documents[i]["text"], documents[j]["text"]) for j in final_idx):
+        txt = documents[i]["text"]
+        if not any(txt[:100] in documents[j]["text"] for j in final_idx):
             final_idx.append(i)
 
-    return [(documents[i], scores[i]) for i in final_idx], expanded_terms
+    return [(documents[i], scores[i]) for i in final_idx], expanded
 
 # ---------------------------------------------------------------
-# 4. Sohbet Geçmişi ve Arayüz Akışı
+# 5. Chat Arayüzü
 # ---------------------------------------------------------------
+st.markdown('<div class="main-header">Hyprland Config Asistanı</div>', unsafe_allow_html=True)
+st.markdown('<div class="sub-header">NPZ Önbellek destekli hızlı RAG asistanı.</div>', unsafe_allow_html=True)
+
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
-# Eski mesajları çiz
-for message in st.session_state.messages:
-    with st.chat_message(message["role"]):
-        st.markdown(message["content"])
-        if "sources" in message:
-            with st.expander("📚 Kullanılan Kaynaklar"):
-                for doc, score in message["sources"]:
-                    tag = "📋 Tablo" if doc["is_table_row"] else "📄 Genel"
-                    st.write(f"**{tag} - {doc['topic']}** (Skor: {score:.3f})")
+# Geçmişi Çiz
+for msg in st.session_state.messages:
+    with st.chat_message(msg["role"]):
+        st.markdown(msg["content"])
+        if "sources" in msg:
+            with st.expander("🔍 Yanıt İçin Kullanılan Kaynaklar"):
+                for doc, score in msg["sources"]:
+                    tag = "📋 Tablo" if doc["is_table_row"] else "📄 Metin"
+                    st.markdown(f"**{tag}** — `{doc['topic']}` *(Benzerlik: {score:.3f})*")
                     st.code(doc["text"], language="markdown")
 
-# Yeni Soru
-if prompt_text := st.chat_input("Hyprland ayarları hakkında bir soru sorun..."):
-    # Kullanıcı mesajı
-    st.session_state.messages.append({"role": "user", "content": prompt_text})
+# Yeni Soru Girişi
+if user_prompt := st.chat_input("Hyprland ayarları hakkında bir soru sorun..."):
+    st.session_state.messages.append({"role": "user", "content": user_prompt})
     with st.chat_message("user"):
-        st.markdown(prompt_text)
+        st.markdown(user_prompt)
 
-    # Asistan cevabı
     with st.chat_message("assistant"):
-        with st.spinner("Wiki taranıyor ve cevap hazırlanıyor..."):
-            results, expanded = retrieve(prompt_text)
+        with st.spinner("Cache taranıyor..."):
+            results, expanded_terms = retrieve(user_prompt, top_k=top_k_slider)
             
-            context_blocks = [f"[Kaynak: {doc['topic']}]\n{doc['text']}" for doc, score in results]
-            context = "\n\n---\n\n".join(context_blocks)
-
-            rag_prompt = f"""Aşağıdaki Hyprland wiki kaynaklarını kullanarak kullanıcının sorusunu cevapla.
-SADECE verilen kaynaklardaki bilgiyi kullan, uydurma bilgi ekleme. Eğer kaynaklarda
-net bir cevap yoksa ama ilgili bir bilgi varsa, onu paylaş ve emin olmadığını belirt.
+            context = "\n\n---\n\n".join([f"[Kaynak: {doc['topic']}]\n{doc['text']}" for doc, _ in results])
+            
+            prompt = f"""Aşağıdaki Hyprland wiki kaynaklarını kullanarak kullanıcının sorusunu cevapla.
+SADECE verilen kaynaklardaki bilgiyi kullan, uydurma bilgi ekleme.
 
 ### Kaynaklar:
 {context}
 
 ### Soru:
-{prompt_text}"""
+{user_prompt}"""
 
-            response = client.models.generate_content(
+            res = client.models.generate_content(
                 model=GEN_MODEL,
-                contents=rag_prompt,
-                config=types.GenerateContentConfig(temperature=0.3),
+                contents=prompt,
+                config=types.GenerateContentConfig(temperature=temp_slider)
             )
-            answer = response.text
+            bot_response = res.text
 
-            st.markdown(answer)
+            st.markdown(bot_response)
 
-            # Kaynakları Göster
-            with st.expander("📚 Kullanılan Kaynaklar & Detaylar"):
-                if expanded:
-                    st.write(f"🔍 **Genişletilmiş Anahtar Kelimeler:** `{', '.join(expanded)}`")
+            with st.expander("🔍 Yanıt İçin Kullanılan Kaynaklar"):
+                if expanded_terms:
+                    st.info(f"💡 **Tahmin Edilen Config Terimleri:** {', '.join(expanded_terms)}")
                 for doc, score in results:
-                    tag = "📋 Tablo" if doc["is_table_row"] else "📄 Genel"
-                    st.write(f"**{tag} - {doc['topic']}** (Skor: {score:.3f})")
+                    tag = "📋 Tablo Satırı" if doc["is_table_row"] else "📄 Metin Bloğu"
+                    st.markdown(f"**{tag}** — `{doc['topic']}` *(Benzerlik: {score:.3f})*")
                     st.code(doc["text"], language="markdown")
 
-    # Geçmişe kaydet
     st.session_state.messages.append({
         "role": "assistant",
-        "content": answer,
+        "content": bot_response,
         "sources": results
     })
