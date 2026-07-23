@@ -96,17 +96,18 @@ def check_intent_with_groq(user_prompt: str) -> bool:
 
     try:
         groq_client = Groq(api_key=GROQ_API_KEY)
-        prompt = f"""Determine whether the user query requires searching a Hyprland Linux configuration/wiki database or web context.
+        prompt = f"""Analyze the user query for intent classification.
 
-Technical search required (YES):
-- Hyprland settings, window rules, keybindings, animations, decorations, input configurations, monitor setups, troubleshooting, or code snippets.
+Classify as YES if the query involves:
+- Technical questions, Hyprland settings, Linux distros (e.g., CachyOS, Fedora, Arch), installation, bootloader, desktop environments, window managers, system configs, or troubleshooting.
+- Questions phrasing migration, switching OS, software options, or configuration choices (even if written in informal/slang language).
 
-No technical search required (NO):
-- Greetings (e.g., "selam", "hello", "hi"), salutations, casual chat, small talk, thanks, farewells, or general questions about identity/well-being.
+Classify as NO ONLY if the query is:
+- Pure casual chat, greeting (e.g., "selam", "hi", "nasılsın"), simple thanks ("eyvallah", "teşekkürler"), or meta questions about the AI.
 
 User Query: "{user_prompt}"
 
-Answer strictly with YES or NO.
+Respond strictly with YES or NO.
 
 Answer:"""
 
