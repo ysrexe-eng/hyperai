@@ -8,6 +8,8 @@ import json
 import re
 import uuid
 import numpy as np
+import requests
+from bs4 import BeautifulSoup
 import streamlit as st
 import torch
 from sentence_transformers import SentenceTransformer
@@ -96,18 +98,55 @@ with st.sidebar:
     status_box = st.empty()
 
 # -----------------------------------------------------------------------------
-# Core Functions & Agent Logic
+# Core Functions & Tool Implementations
 # -----------------------------------------------------------------------------
 
+def scrape_url(url: str, timeout: int = 6) -> str:
+    """Scrapes raw text content from a given URL, stripping scripts/styles."""
+    try:
+        headers = {
+            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        }
+        response = requests.get(url, headers=headers, timeout=timeout)
+        if response.status_code == 200:
+            soup = BeautifulSoup(response.text, "html.parser")
+            for element in soup(["script", "style", "nav", "footer", "header", "aside", "form"]):
+                element.extract()
+            text = soup.get_text(separator=" ")
+            lines = (line.strip() for line in text.splitlines())
+            chunks = (phrase.strip() for line in lines for phrase in line.split("  "))
+            clean_text = "\n".join(chunk for chunk in chunks if chunk)
+            return clean_text[:4000]  # Limit context length
+        return f"HTTP Error {response.status_code} while fetching {url}"
+    except Exception as e:
+        return f"Failed to scrape URL {url}: {e}"
+
+def scrape_urls_multi(urls: list[str]) -> tuple[str, list[dict]]:
+    """Scrapes multiple URLs and aggregates text blocks."""
+    scraped_docs = []
+    metadata = []
+    for url in urls:
+        content = scrape_url(url)
+        if content and not content.startswith("Failed"):
+            scraped_docs.append(f"[Scraped URL: {url}]\nContent:\n{content}")
+            metadata.append({"url": url, "length": len(content), "snippet": content[:200] + "..."})
+    
+    formatted_context = "\n\n---\n\n".join(scraped_docs) if scraped_docs else ""
+    return formatted_context, metadata
+
 def agent_router(user_prompt: str, force_web: bool = False) -> dict:
-    """Agent router that analyzes intent and dynamically determines needed tools and queries."""
+    """Agent router that analyzes intent and dynamically determines needed tools, web queries, and scrape targets."""
+    extracted_urls = re.findall(r'https?://[^\s]+', user_prompt)
+
     if not GROQ_API_KEY:
         return {
             "need_local_rag": True,
             "need_web_search": force_web,
             "web_queries": [user_prompt],
+            "need_web_scrape": bool(extracted_urls),
+            "scrape_urls": extracted_urls,
             "expanded_terms": [],
-            "reasoning": "Groq API Key missing. Defaulting to standard RAG pipeline."
+            "reasoning": "Groq API Key missing. Defaulting to standard fallback execution."
         }
 
     try:
@@ -117,17 +156,22 @@ Analyze the user's input and decide which tools to execute.
 
 User Query: "{user_prompt}"
 
-Task Rules:
-1. Determine if local Hyprland documentation search is needed (need_local_rag).
-2. Determine if live web search is needed (need_web_search) for Linux distributions (e.g., CachyOS, Arch, Fedora), external tools, recent updates, or general troubleshooting.
-3. If web search is needed, generate EXACTLY 2 to 3 distinct, highly focused technical search queries in English to cover different angles.
-4. Predict 2-3 specific Hyprland configuration keys or parameters in English (expanded_terms).
+CRITICAL RULE FOR GREETINGS & SMALL TALK:
+- If the query is a simple greeting (e.g., "selam", "hi", "hello", "merhaba", "sa"), casual small talk, or simple gratitude ("eyvallah", "thanks"), set "need_local_rag": false, "need_web_search": false, and "need_web_scrape": false.
 
-Return ONLY a valid JSON object with the following schema:
+Task Rules for Technical Queries & Tools:
+1. Set "need_local_rag": true if the query involves Hyprland settings, keybinds, or local documentation.
+2. Set "need_web_search": true if the query asks about external tools, Linux distros (CachyOS, Arch, etc.), troubleshooting, or recent news. Generate 2 to 3 distinct search queries in English.
+3. Set "need_web_scrape": true if the user provided a URL (e.g. https://...) OR explicitly asks to read/inspect a specific website content. Extract or specify the target URLs in "scrape_urls".
+4. Predict 2-3 specific Hyprland configuration keys in English ("expanded_terms").
+
+Return ONLY a valid JSON object matching this schema:
 {{
     "need_local_rag": boolean,
     "need_web_search": boolean,
-    "web_queries": ["query 1", "query 2", "query 3"],
+    "web_queries": ["query 1", "query 2"],
+    "need_web_scrape": boolean,
+    "scrape_urls": ["https://example.com"],
     "expanded_terms": ["term1", "term2"],
     "reasoning": "Brief explanation of tool decision"
 }}
@@ -136,22 +180,31 @@ Return ONLY a valid JSON object with the following schema:
         res = groq_client.chat.completions.create(
             messages=[{"role": "user", "content": prompt}],
             model=GROQ_INTENT_MODEL,
-            temperature=0.1,
+            temperature=0.0,
             response_format={"type": "json_object"}
         )
         
         decision = json.loads(res.choices[0].message.content)
+        
+        # Override scrape URLs if explicit URLs were passed by user
+        if extracted_urls and not decision.get("scrape_urls"):
+            decision["need_web_scrape"] = True
+            decision["scrape_urls"] = extracted_urls
+
         if force_web:
             decision["need_web_search"] = True
             if not decision.get("web_queries"):
-                decision["web_queries"] = [user_prompt, f"{user_prompt} Linux Hyprland config"]
+                decision["web_queries"] = [user_prompt]
+
         return decision
 
     except Exception as e:
         return {
             "need_local_rag": True,
             "need_web_search": force_web,
-            "web_queries": [user_prompt, f"{user_prompt} Hyprland"],
+            "web_queries": [user_prompt],
+            "need_web_scrape": bool(extracted_urls),
+            "scrape_urls": extracted_urls,
             "expanded_terms": [],
             "reasoning": f"Routing failed ({e}). Fallback triggered."
         }
@@ -252,7 +305,7 @@ except Exception as e:
 
 # Main Application UI
 st.markdown('<div class="main-header">HyperAI Agent</div>', unsafe_allow_html=True)
-st.markdown('<div class="sub-header">Autonomous RAG & Multi-Query Search Assistant for Hyprland & Linux Systems</div>', unsafe_allow_html=True)
+st.markdown('<div class="sub-header">Autonomous RAG, Multi-Query Search & Web Scraping Assistant for Hyprland & Linux</div>', unsafe_allow_html=True)
 
 active_chat = st.session_state.chats[st.session_state.active_chat_id]
 
@@ -271,9 +324,14 @@ for msg in active_chat["messages"]:
                 for meta in msg["web_sources"]:
                     st.markdown(f"**[{meta['title']}]({meta['url']})** *(Query: `{meta['query']}`)*")
                     st.caption(meta['snippet'])
+        if "scraped_sources" in msg and msg["scraped_sources"]:
+            with st.expander("🕷️ Web Scraping Sources"):
+                for meta in msg["scraped_sources"]:
+                    st.markdown(f"**[Scraped: {meta['url']}]({meta['url']})** *(Length: {meta['length']} chars)*")
+                    st.caption(meta['snippet'])
 
 # Chat Input Handler
-if user_prompt := st.chat_input("Ask about Hyprland, Linux distros, or request configurations..."):
+if user_prompt := st.chat_input("Ask about Hyprland, paste a URL to scrape, or request configs..."):
     if len(active_chat["messages"]) == 0:
         active_chat["title"] = user_prompt[:25] + ("..." if len(user_prompt) > 25 else "")
 
@@ -285,6 +343,8 @@ if user_prompt := st.chat_input("Ask about Hyprland, Linux distros, or request c
         results = []
         web_context = ""
         web_metadata = []
+        scraped_context = ""
+        scraped_metadata = []
 
         with st.status("🤖 Agent executing workflow...", expanded=True) as status:
             # Step 1: Agent Decision Making
@@ -293,8 +353,8 @@ if user_prompt := st.chat_input("Ask about Hyprland, Linux distros, or request c
             status.write(f"💭 **Agent Reasoning:** *\"{decision.get('reasoning')}\"*")
 
             # Step 2: Local RAG Retrieval (if requested)
-            if decision.get("need_local_rag", True):
-                status.write("🔍 **Tool Execution:** Searching local vector dataset...")
+            if decision.get("need_local_rag", False):
+                status.write("🔍 **Tool Execution (RAG):** Searching local vector dataset...")
                 expanded_terms = decision.get("expanded_terms", [])
                 
                 if expanded_terms:
@@ -329,23 +389,36 @@ if user_prompt := st.chat_input("Ask about Hyprland, Linux distros, or request c
 
             # Step 3: Dynamic Multi-Query Web Search (if requested)
             if decision.get("need_web_search", False):
-                queries = decision.get("web_queries", [user_prompt])
-                status.write(f"🌐 **Tool Execution:** Initiating {len(queries)} dynamic web searches...")
-                
-                for idx, q in enumerate(queries, 1):
-                    status.write(f"   ↳ 🔎 Search Query {idx}/{len(queries)}: `{q}`")
-                
-                web_context, web_metadata = search_web_multi(queries, max_results_per_query=2)
-                status.write(f"✓ Collected **{len(web_metadata)}** unique live web snippets.")
+                queries = decision.get("web_queries", [])
+                if queries:
+                    status.write(f"🌐 **Tool Execution (Search):** Initiating {len(queries)} dynamic web searches...")
+                    for idx, q in enumerate(queries, 1):
+                        status.write(f"   ↳ 🔎 Search Query {idx}/{len(queries)}: `{q}`")
+                    
+                    web_context, web_metadata = search_web_multi(queries, max_results_per_query=2)
+                    status.write(f"✓ Collected **{len(web_metadata)}** unique live web snippets.")
+
+            # Step 4: Web Scraping Tool (if requested)
+            if decision.get("need_web_scrape", False):
+                scrape_urls = decision.get("scrape_urls", [])
+                if scrape_urls:
+                    status.write(f"🕷️ **Tool Execution (Web Scraping):** Scraping {len(scrape_urls)} target URLs...")
+                    for target_url in scrape_urls:
+                        status.write(f"   ↳ 🕸️ Scraping URL: `{target_url}`")
+                    
+                    scraped_context, scraped_metadata = scrape_urls_multi(scrape_urls)
+                    status.write(f"✓ Successfully extracted content from **{len(scraped_metadata)}** web pages.")
 
             status.update(label="🚀 Synthesizing response...", state="complete", expanded=False)
 
-        # Step 4: Build Context and Stream Gemini Response
+        # Step 5: Build Context and Stream Gemini Response
         local_context = "\n\n---\n\n".join([f"[Source: {doc['topic']}]\n{doc['text']}" for doc, _ in results]) if results else "No local wiki context used."
         
         full_context = f"### Local Knowledge Base:\n{local_context}"
         if web_context:
             full_context += f"\n\n### Web Search Context:\n{web_context}"
+        if scraped_context:
+            full_context += f"\n\n### Directly Scraped Web Content:\n{scraped_context}"
 
         history_text = ""
         for m in active_chat["messages"][-6:-1]:
@@ -353,7 +426,7 @@ if user_prompt := st.chat_input("Ask about Hyprland, Linux distros, or request c
             history_text += f"{role_name}: {m['content']}\n"
 
         system_prompt = f"""You are HyperAI, an expert system engineer and Hyprland assistant.
-You are interacting with the user. Use a clear, concise, well-formatted, and helpful tone.
+You are interacting with the user. Use a clear, concise, well-formatted, and friendly tone.
 
 {full_context}
 
@@ -364,9 +437,9 @@ You are interacting with the user. Use a clear, concise, well-formatted, and hel
 {user_prompt}
 
 ### Instructions:
-1. Respond naturally in the language used by the user (or English if technical standard).
-2. Use the provided Knowledge Base and Web Search Context to give accurate answers.
-3. Provide code blocks (e.g., `hyprland.conf`, bash scripts) whenever technical configuration is requested.
+1. If the user is making casual conversation, reply naturally in the language they used.
+2. For technical queries, analyze the Knowledge Base, Web Search, and Scraped Web Content if present.
+3. Provide code blocks whenever technical configuration is requested.
 """
 
         def stream_generator():
@@ -396,11 +469,18 @@ You are interacting with the user. Use a clear, concise, well-formatted, and hel
                         st.markdown(f"**[{meta['title']}]({meta['url']})** *(Query: `{meta['query']}`)*")
                         st.caption(meta['snippet'])
 
+            if scraped_metadata:
+                with st.expander("🕷️ Web Scraping Sources"):
+                    for meta in scraped_metadata:
+                        st.markdown(f"**[Scraped: {meta['url']}]({meta['url']})** *(Length: {meta['length']} chars)*")
+                        st.caption(meta['snippet'])
+
             active_chat["messages"].append({
                 "role": "assistant",
                 "content": full_response,
                 "sources": results,
-                "web_sources": web_metadata
+                "web_sources": web_metadata,
+                "scraped_sources": scraped_metadata
             })
 
         except APIError as e:
