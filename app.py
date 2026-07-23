@@ -16,7 +16,7 @@ from google import genai
 from google.genai import types
 from ddgs import DDGS
 
-# Streamlit Page Config
+# Streamlit Page Configuration
 st.set_page_config(
     page_title="HyperAI - High-Concurrency Agentic RAG",
     page_icon="⚡",
@@ -36,7 +36,7 @@ st.markdown("""
 
 # Configuration Constants
 GEN_MODEL = "gemma-4-31b-it"
-EMBED_MODEL_NAME = "BAAI/bge-small-en-v1.5" # ONNX Tabanlı Aşırı Hızlı Embedding
+EMBED_MODEL_NAME = "intfloat/multilingual-e5-large"  # High-performance Multilingual FastEmbed Model
 INPUT_PATH = "hyprland_dataset.json"
 CACHE_PATH = "rag_cache.npz"
 CHUNK_SIZE = 500
@@ -48,7 +48,7 @@ SKIP_KEYWORDS = ["readme", "version-selector", "_index", "license"]
 # -----------------------------------------------------------------------------
 
 class GlobalKeyPool:
-    """Tüm eşzamanlı oturumlar arasında güvenle paylaşılan API key rotatörü."""
+    """Thread-safe API key rotator shared across all concurrent sessions."""
     def __init__(self):
         self.lock = threading.Lock()
         self.keys = self._discover_keys()
@@ -68,7 +68,7 @@ class GlobalKeyPool:
                 if (k == "GEMINI_API_KEY" or k.startswith("GEMINI_API_KEY_")) and isinstance(v, str) and v.strip():
                     keys.append(v.strip())
 
-        # Unique keys
+        # Deduplicate keys
         res = []
         for k in keys:
             if k and k not in res:
@@ -85,7 +85,6 @@ class GlobalKeyPool:
         with self.lock:
             if len(self.keys) <= 1:
                 return False
-            old_idx = self.active_index
             self.active_index = (self.active_index + 1) % len(self.keys)
             return True
 
@@ -93,30 +92,29 @@ class GlobalKeyPool:
     def status_info(self) -> str:
         with self.lock:
             if not self.keys:
-                return "❌ API Key Bulunamadı"
-            return f"🔑 Havuzdaki Key Sayısı: {len(self.keys)} | Aktif Key: #{self.active_index + 1}"
+                return "❌ No API Keys Found"
+            return f"🔑 API Key Pool Size: {len(self.keys)} | Active Key Index: #{self.active_index + 1}"
 
 @st.cache_resource
 def get_global_key_pool():
     return GlobalKeyPool()
 
 # -----------------------------------------------------------------------------
-# 2. Thread-Safe Semantic Cache (Benzer Soru Önbelleği)
+# 2. Thread-Safe Semantic Cache
 # -----------------------------------------------------------------------------
 
 class SemanticCache:
-    """Anlamca benzeyen soruları 0 ms'de yanıtlamak için bellek içi önbellek."""
+    """In-memory vector cache to answer semantically similar queries in 0 ms."""
     def __init__(self, threshold: float = 0.90):
         self.lock = threading.Lock()
         self.threshold = threshold
-        self.cache = [] # List of dicts: {"vector": np.array, "response": str, "sources": list}
+        self.cache = []  # List of dicts: {"vector": np.array, "response": str, "sources": list}
 
     def search(self, query_vector: np.ndarray):
         with self.lock:
             if not self.cache:
                 return None, 0.0
 
-            # Normalize query vector
             q_norm = query_vector / np.linalg.norm(query_vector)
 
             for item in self.cache:
@@ -130,7 +128,7 @@ class SemanticCache:
 
     def add(self, query_vector: np.ndarray, response: str, sources: list):
         with self.lock:
-            # Önbellekte maksimum 500 yanıt tut (Bellek şişmesini önle)
+            # Prevent unbounded memory usage (max 500 cached entries)
             if len(self.cache) >= 500:
                 self.cache.pop(0)
 
@@ -146,17 +144,17 @@ def get_semantic_cache():
     return SemanticCache(threshold=0.90)
 
 # -----------------------------------------------------------------------------
-# 3. High-Speed FastEmbed & Parallel Execution Worker Pool
+# 3. High-Speed Multilingual FastEmbed & Worker Pool
 # -----------------------------------------------------------------------------
 
 @st.cache_resource
 def get_fast_embedder():
-    # PyTorch yerine ONNX tabanlı hafif ve hızlı FastEmbed
+    # High-performance Multilingual FastEmbed Engine
     return TextEmbedding(model_name=EMBED_MODEL_NAME)
 
 @st.cache_resource
 def get_worker_pool():
-    # CPU kilitlenmesini önlemek için maksimum 4 paralellik
+    # Limit concurrent threads to prevent CPU lockup
     return ThreadPoolExecutor(max_workers=4)
 
 @st.cache_data
@@ -183,7 +181,7 @@ def load_data_and_cache():
         return chunks
 
     if not os.path.exists(INPUT_PATH) or not os.path.exists(CACHE_PATH):
-        st.error(f"❌ '{INPUT_PATH}' veya '{CACHE_PATH}' eksik!")
+        st.error(f"❌ Missing dataset files: '{INPUT_PATH}' or '{CACHE_PATH}'!")
         st.stop()
 
     with open(INPUT_PATH, "r", encoding="utf-8") as f:
@@ -206,7 +204,7 @@ def load_data_and_cache():
     embeddings = cache["embeddings"]
     return documents, embeddings
 
-# Initialize Global Architecture Components
+# Initialize Infrastructure Components
 key_pool = get_global_key_pool()
 semantic_cache = get_semantic_cache()
 embedder = get_fast_embedder()
@@ -215,11 +213,11 @@ worker_pool = get_worker_pool()
 try:
     documents, embeddings = load_data_and_cache()
 except Exception as e:
-    st.error(f"Başlatma Hatası: {e}")
+    st.error(f"Initialization Error: {e}")
     st.stop()
 
 # -----------------------------------------------------------------------------
-# Core Tools & Resilient Ajan Yönlendirici
+# Core Tools & Resilient Agent Router
 # -----------------------------------------------------------------------------
 
 def scrape_url(url: str, timeout: int = 5) -> str:
@@ -258,7 +256,7 @@ Tools Executed: {json.dumps(tools_used)}
 Current Context Summary: "{context_summary}"
 
 RULES:
-1. GREETINGS ("selam", "hi", "merhaba"): Choose "finish" instantly.
+1. GREETINGS ("hello", "hi", "selam", "merhaba"): Choose "finish" instantly.
 2. LOCAL RAG: Choose "local_rag" if Hyprland/Linux configs are needed and "local_rag" NOT in Tools Executed.
 3. WEB SEARCH: Choose "web_search" for external distros, live news, or non-Hyprland tools.
 4. WEB SCRAPE: Choose "web_scrape" if URL is in user prompt.
@@ -299,7 +297,7 @@ Return JSON matching schema:
 if "chats" not in st.session_state:
     st.session_state.chats = {}
     default_id = str(uuid.uuid4())
-    st.session_state.chats[default_id] = {"title": "Yeni Oturum", "messages": []}
+    st.session_state.chats[default_id] = {"title": "New Session", "messages": []}
     st.session_state.active_chat_id = default_id
 
 if "active_chat_id" not in st.session_state or st.session_state.active_chat_id not in st.session_state.chats:
@@ -307,9 +305,9 @@ if "active_chat_id" not in st.session_state or st.session_state.active_chat_id n
 
 with st.sidebar:
     st.title("⚡ HyperAI Agent")
-    if st.button("➕ Yeni Sohbet", use_container_width=True):
+    if st.button("➕ New Chat", use_container_width=True):
         new_id = str(uuid.uuid4())
-        st.session_state.chats[new_id] = {"title": f"Sohbet {len(st.session_state.chats) + 1}", "messages": []}
+        st.session_state.chats[new_id] = {"title": f"Chat {len(st.session_state.chats) + 1}", "messages": []}
         st.session_state.active_chat_id = new_id
         st.rerun()
 
@@ -317,18 +315,18 @@ with st.sidebar:
     chat_ids = list(chat_options.keys())
     curr_idx = chat_ids.index(st.session_state.active_chat_id) if st.session_state.active_chat_id in chat_ids else 0
 
-    selected_chat_id = st.selectbox("Sohbet Geçmişi", options=chat_ids, format_func=lambda cid: chat_options[cid], index=curr_idx)
+    selected_chat_id = st.selectbox("Session History", options=chat_ids, format_func=lambda cid: chat_options[cid], index=curr_idx)
     if selected_chat_id != st.session_state.active_chat_id:
         st.session_state.active_chat_id = selected_chat_id
         st.rerun()
 
     st.markdown("---")
-    st.markdown("### 📊 Sistem & Sunucu Durumu")
+    st.markdown("### 📊 System & Server Metrics")
     st.info(key_pool.status_info)
-    st.caption(f"🚀 Önbellekteki Yanıt Sayısı: {len(semantic_cache.cache)}")
+    st.caption(f"🚀 Cached Responses Count: {len(semantic_cache.cache)}")
 
 st.markdown('<div class="main-header">HyperAI Agent</div>', unsafe_allow_html=True)
-st.markdown('<div class="sub-header">50+ Kullanıcı Destekli Semantik Önbellekli RAG Mimarisi</div>', unsafe_allow_html=True)
+st.markdown('<div class="sub-header">50+ Concurrency Resilient Agentic RAG Architecture</div>', unsafe_allow_html=True)
 
 active_chat = st.session_state.chats[st.session_state.active_chat_id]
 
@@ -337,10 +335,10 @@ for msg in active_chat["messages"]:
     with st.chat_message(msg["role"]):
         st.markdown(msg["content"])
         if msg.get("from_cache"):
-            st.markdown('<span class="cache-badge">⚡ Önbellek Yanıtı (0 ms)</span>', unsafe_allow_html=True)
+            st.markdown('<span class="cache-badge">⚡ Cached Response (0 ms)</span>', unsafe_allow_html=True)
 
 # User Input Handling
-if user_prompt := st.chat_input("Bir soru sorun veya Hyprland konfigürasyonu isteyin..."):
+if user_prompt := st.chat_input("Ask a question, request a config, or paste a URL..."):
     if len(active_chat["messages"]) == 0:
         active_chat["title"] = user_prompt[:25] + "..."
 
@@ -349,14 +347,14 @@ if user_prompt := st.chat_input("Bir soru sorun veya Hyprland konfigürasyonu is
         st.markdown(user_prompt)
 
     with st.chat_message("assistant"):
-        # FAST-PATH 1: Embedding Üretimi (FastEmbed - ONNX)
+        # FAST-PATH 1: Vector Generation (FastEmbed - Multilingual ONNX)
         query_vec = list(embedder.embed([f"query: {user_prompt}"]))[0]
 
-        # FAST-PATH 2: Semantik Önbellek Kontrolü (0 ms)
+        # FAST-PATH 2: Semantic Cache Check (0 ms)
         cached_item, similarity = semantic_cache.search(query_vec)
         if cached_item:
             st.markdown(cached_item["response"])
-            st.markdown(f'<span class="cache-badge">⚡ Önbellekten Getirildi (%{similarity*100:.1f} Benzerlik)</span>', unsafe_allow_html=True)
+            st.markdown(f'<span class="cache-badge">⚡ Retrieved from Cache ({similarity*100:.1f}% Similarity)</span>', unsafe_allow_html=True)
             active_chat["messages"].append({
                 "role": "assistant",
                 "content": cached_item["response"],
@@ -364,28 +362,28 @@ if user_prompt := st.chat_input("Bir soru sorun veya Hyprland konfigürasyonu is
             })
             st.stop()
 
-        # FAST-PATH BİTTİ -> Ağır RAG & Ajan İşlemi
+        # FAST-PATH END -> Full Agent Execution
         rag_results = []
         web_context, web_metadata = "", []
         scraped_context = ""
         tools_executed = []
         context_accumulator = []
 
-        with st.status("🧠 Gemma Ajanı Çalışıyor...", expanded=True) as status:
+        with st.status("🧠 Gemma Agent Thinking...", expanded=True) as status:
             for step in range(1, 4):
                 summary_str = " | ".join(context_accumulator)[:1000]
                 decision = gemma_router_resilient(key_pool, user_prompt, summary_str, tools_executed)
                 action = decision.get("next_action", "finish")
                 reasoning = decision.get("reasoning", "")
 
-                status.write(f"💭 **Ajan Adımı {step}:** *\"{reasoning}\"*")
+                status.write(f"💭 **Agent Step {step}:** *\"{reasoning}\"*")
 
                 if action == "finish":
                     break
 
                 elif action == "local_rag" and "local_rag" not in tools_executed:
                     tools_executed.append("local_rag")
-                    status.write("🔍 **Local RAG Vektör Araması Yapılıyor...**")
+                    status.write("🔍 **Executing Tool:** Local Vector Dataset Search...")
                     
                     q_norm = query_vec / np.linalg.norm(query_vec)
                     scores = embeddings @ q_norm
@@ -396,7 +394,7 @@ if user_prompt := st.chat_input("Bir soru sorun veya Hyprland konfigürasyonu is
                 elif action == "web_search" and "web_search" not in tools_executed:
                     tools_executed.append("web_search")
                     queries = decision.get("web_queries", [user_prompt])
-                    status.write(f"🌐 **Web Araması Yapılıyor:** `{queries[0]}`")
+                    status.write(f"🌐 **Executing Tool:** Web Search (`{queries[0]}`)...")
                     web_context, web_metadata = search_web_multi(queries)
                     context_accumulator.append(f"Web Search found {len(web_metadata)} snippets.")
 
@@ -407,7 +405,7 @@ if user_prompt := st.chat_input("Bir soru sorun veya Hyprland konfigürasyonu is
                         scraped_context = scrape_url(scrape_urls[0])
                         context_accumulator.append("URL scraped.")
 
-            status.update(label="🚀 Yanıt Sentezleniyor...", state="complete", expanded=False)
+            status.update(label="🚀 Synthesizing Response...", state="complete", expanded=False)
 
         # Full Context Construction
         full_context = ""
@@ -446,12 +444,12 @@ User Query: {user_prompt}
                     if any(term in err_msg for term in ["429", "resource_exhausted", "quota", "rate limit"]):
                         key_pool.rotate_on_limit()
                         continue
-                    yield f"❌ Hata: {e}"
+                    yield f"❌ Error: {e}"
                     break
 
         full_response = st.write_stream(stream_response())
 
-        # Cevabı Semantik Önbelleğe Kaydet (Gelecek Kullanıcılar İçin)
+        # Cache successful responses for future queries
         if full_response and len(full_response) > 20:
             semantic_cache.add(query_vec, full_response, rag_results)
 
