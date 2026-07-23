@@ -3,3 +3,4 @@ sentence-transformers
 google-genai
 numpy
 groq
+duckduckgo_search
