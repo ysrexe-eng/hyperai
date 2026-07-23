@@ -36,7 +36,7 @@ st.markdown("""
 
 # Configuration Constants
 GEN_MODEL = "gemma-4-31b-it"
-EMBED_MODEL_NAME = "intfloat/multilingual-e5-small"  # High-performance Multilingual FastEmbed Model
+EMBED_MODEL_NAME = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"  # High-performance Multilingual FastEmbed Model
 INPUT_PATH = "hyprland_dataset.json"
 CACHE_PATH = "rag_cache.npz"
 CHUNK_SIZE = 500
