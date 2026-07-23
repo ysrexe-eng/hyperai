@@ -19,21 +19,24 @@ from ddgs import DDGS
 
 torch.set_num_threads(2)
 
+# Page Configuration
 st.set_page_config(
-    page_title="HyperAI",
+    page_title="HyperAI - Agentic RAG Assistant",
     page_icon="⚡",
     layout="wide",
     initial_sidebar_state="expanded"
 )
 
+# Custom Styling
 st.markdown("""
 <style>
     .stApp { background-color: #0e1117; }
-    .main-header { font-size: 2rem; font-weight: 700; color: #58a6ff; margin-bottom: 0.2rem; }
+    .main-header { font-size: 2.2rem; font-weight: 700; color: #58a6ff; margin-bottom: 0.2rem; }
     .sub-header { font-size: 0.95rem; color: #8b949e; margin-bottom: 1.5rem; }
 </style>
 """, unsafe_allow_html=True)
 
+# Configuration Constants
 GEN_MODEL = "gemma-4-31b-it"
 GROQ_INTENT_MODEL = "llama-3.1-8b-instant"
 EMBED_MODEL_NAME = "intfloat/multilingual-e5-large"
@@ -43,20 +46,23 @@ CHUNK_SIZE = 500
 CHUNK_OVERLAP = 120
 SKIP_KEYWORDS = ["readme", "version-selector", "_index", "license"]
 
+# API Keys Initialization
 API_KEY = st.secrets.get("GEMINI_API_KEY") or os.environ.get("GEMINI_API_KEY", "")
 GROQ_API_KEY = st.secrets.get("GROQ_API_KEY") or os.environ.get("GROQ_API_KEY", "")
 
+# Session State Initialization
 if "chats" not in st.session_state:
     st.session_state.chats = {}
     default_id = str(uuid.uuid4())
-    st.session_state.chats[default_id] = {"title": "New Chat", "messages": []}
+    st.session_state.chats[default_id] = {"title": "New Session", "messages": []}
     st.session_state.active_chat_id = default_id
 
 if "active_chat_id" not in st.session_state or st.session_state.active_chat_id not in st.session_state.chats:
     st.session_state.active_chat_id = list(st.session_state.chats.keys())[0]
 
+# Sidebar Interface
 with st.sidebar:
-    st.title("⚡ HyperAI")
+    st.title("⚡ HyperAI Agent")
     
     if st.button("➕ New Chat", use_container_width=True):
         new_id = str(uuid.uuid4())
@@ -69,7 +75,7 @@ with st.sidebar:
     current_index = chat_ids.index(st.session_state.active_chat_id) if st.session_state.active_chat_id in chat_ids else 0
 
     selected_chat_id = st.selectbox(
-        "Chat History",
+        "Session History",
         options=chat_ids,
         format_func=lambda cid: chat_options[cid],
         index=current_index
@@ -80,65 +86,102 @@ with st.sidebar:
         st.rerun()
 
     st.markdown("---")
-    
-    top_k_slider = st.slider("Documents to Retrieve (Top K)", min_value=3, max_value=20, value=10)
-    temp_slider = st.slider("Temperature", min_value=0.0, max_value=1.0, value=0.3, step=0.1)
-    use_expansion = st.checkbox("Query Expansion", value=False, help="Uses LLM to predict additional configuration parameter names.")
-    use_web_search = st.checkbox("Web Search", value=False, help="Fetches live search results from DuckDuckGo.")
+    st.markdown("### 🎛️ Agent Settings")
+    top_k_slider = st.slider("Max RAG Documents", min_value=3, max_value=20, value=8)
+    temp_slider = st.slider("Model Temperature", min_value=0.0, max_value=1.0, value=0.3, step=0.1)
+    force_web_search = st.checkbox("Force Web Search", value=False, help="Forces the Agent to conduct web research regardless of query intent.")
     
     st.markdown("---")
-    st.markdown("### 📊 Status")
+    st.markdown("### 📊 System Status")
     status_box = st.empty()
 
-def check_intent_with_groq(user_prompt: str) -> bool:
+# -----------------------------------------------------------------------------
+# Core Functions & Agent Logic
+# -----------------------------------------------------------------------------
+
+def agent_router(user_prompt: str, force_web: bool = False) -> dict:
+    """Agent router that analyzes intent and dynamically determines needed tools and queries."""
     if not GROQ_API_KEY:
-        return True
+        return {
+            "need_local_rag": True,
+            "need_web_search": force_web,
+            "web_queries": [user_prompt],
+            "expanded_terms": [],
+            "reasoning": "Groq API Key missing. Defaulting to standard RAG pipeline."
+        }
 
     try:
         groq_client = Groq(api_key=GROQ_API_KEY)
-        prompt = f"""Analyze the user query for intent classification.
-
-Classify as YES if the query involves:
-- Technical questions, Hyprland settings, Linux distros (e.g., CachyOS, Fedora, Arch), installation, bootloader, desktop environments, window managers, system configs, or troubleshooting.
-- Questions phrasing migration, switching OS, software options, or configuration choices (even if written in informal/slang language).
-
-Classify as NO ONLY if the query is:
-- Pure casual chat, greeting (e.g., "selam", "hi", "nasılsın"), simple thanks ("eyvallah", "teşekkürler"), or meta questions about the AI.
+        prompt = f"""You are an Autonomous AI Router Agent for a Hyprland & Linux System Assistant.
+Analyze the user's input and decide which tools to execute.
 
 User Query: "{user_prompt}"
 
-Respond strictly with YES or NO.
+Task Rules:
+1. Determine if local Hyprland documentation search is needed (need_local_rag).
+2. Determine if live web search is needed (need_web_search) for Linux distributions (e.g., CachyOS, Arch, Fedora), external tools, recent updates, or general troubleshooting.
+3. If web search is needed, generate EXACTLY 2 to 3 distinct, highly focused technical search queries in English to cover different angles.
+4. Predict 2-3 specific Hyprland configuration keys or parameters in English (expanded_terms).
 
-Answer:"""
+Return ONLY a valid JSON object with the following schema:
+{{
+    "need_local_rag": boolean,
+    "need_web_search": boolean,
+    "web_queries": ["query 1", "query 2", "query 3"],
+    "expanded_terms": ["term1", "term2"],
+    "reasoning": "Brief explanation of tool decision"
+}}
+"""
 
         res = groq_client.chat.completions.create(
             messages=[{"role": "user", "content": prompt}],
             model=GROQ_INTENT_MODEL,
-            temperature=0.0,
-            max_tokens=5,
+            temperature=0.1,
+            response_format={"type": "json_object"}
         )
-        answer = res.choices[0].message.content.strip().upper()
-        return "YES" in answer
-    except Exception:
-        return True
+        
+        decision = json.loads(res.choices[0].message.content)
+        if force_web:
+            decision["need_web_search"] = True
+            if not decision.get("web_queries"):
+                decision["web_queries"] = [user_prompt, f"{user_prompt} Linux Hyprland config"]
+        return decision
 
-def search_web(query: str, max_results: int = 3) -> str:
-    try:
-        results = list(DDGS().text(query, max_results=max_results))
-        if not results:
-            return ""
-        web_docs = []
-        for r in results:
-            web_docs.append(f"[Web Source: {r.get('title')}]\n{r.get('body')}\nURL: {r.get('href')}")
-        return "\n\n---\n\n".join(web_docs)
-    except Exception:
-        return ""
+    except Exception as e:
+        return {
+            "need_local_rag": True,
+            "need_web_search": force_web,
+            "web_queries": [user_prompt, f"{user_prompt} Hyprland"],
+            "expanded_terms": [],
+            "reasoning": f"Routing failed ({e}). Fallback triggered."
+        }
+
+def search_web_multi(queries: list[str], max_results_per_query: int = 2) -> tuple[str, list[dict]]:
+    """Executes multiple web searches concurrently and aggregates unique context."""
+    aggregated_docs = []
+    metadata_list = []
+    seen_urls = set()
+
+    ddgs = DDGS()
+    for q in queries:
+        try:
+            results = list(ddgs.text(q, max_results=max_results_per_query))
+            for r in results:
+                href = r.get('href')
+                if href and href not in seen_urls:
+                    seen_urls.add(href)
+                    doc_str = f"[Web Source: {r.get('title')}]\nQuery: {q}\nSnippet: {r.get('body')}\nURL: {href}"
+                    aggregated_docs.append(doc_str)
+                    metadata_list.append({"query": q, "title": r.get('title'), "url": href, "snippet": r.get('body')})
+        except Exception:
+            continue
+
+    formatted_context = "\n\n---\n\n".join(aggregated_docs) if aggregated_docs else ""
+    return formatted_context, metadata_list
 
 @st.cache_resource
 def get_gemini_client(key):
-    if not key:
-        return None
-    return genai.Client(api_key=key)
+    return genai.Client(api_key=key) if key else None
 
 @st.cache_resource
 def load_embedder():
@@ -167,8 +210,8 @@ def load_data_and_cache():
             start += size - overlap
         return chunks
 
-    if not os.path.exists(INPUT_PATH):
-        st.error(f"❌ File '{INPUT_PATH}' not found!")
+    if not os.path.exists(INPUT_PATH) or not os.path.exists(CACHE_PATH):
+        st.error(f"❌ Missing dataset files ('{INPUT_PATH}' or '{CACHE_PATH}')!")
         st.stop()
 
     with open(INPUT_PATH, "r", encoding="utf-8") as f:
@@ -187,47 +230,52 @@ def load_data_and_cache():
             if len(chunk.strip()) >= 50:
                 documents.append({"topic": topic, "text": chunk, "is_table_row": False})
 
-    if not os.path.exists(CACHE_PATH):
-        st.error(f"❌ Cache file '{CACHE_PATH}' not found!")
-        st.stop()
-
     cache = np.load(CACHE_PATH, allow_pickle=True)
     embeddings = cache["embeddings"]
 
     return documents, embeddings
 
+# Initialize Backend
 if not API_KEY:
-    status_box.error("❌ GEMINI_API_KEY not found!")
-    st.error("🔑 API Key missing. Please add `GEMINI_API_KEY` to Streamlit Cloud Secrets.")
+    status_box.error("❌ GEMINI_API_KEY missing!")
+    st.error("🔑 Please set GEMINI_API_KEY in your environment or Streamlit Secrets.")
     st.stop()
 
 try:
     embedder = load_embedder()
     documents, embeddings = load_data_and_cache()
     client = get_gemini_client(API_KEY)
-    status_box.success(f"✅ Ready! ({len(embeddings)} embeddings active)")
+    status_box.success(f"✅ Ready! ({len(embeddings)} RAG vectors active)")
 except Exception as e:
-    status_box.error(f"System Error: {e}")
+    status_box.error(f"Initialization Error: {e}")
     st.stop()
 
-st.markdown('<div class="main-header">HyperAI</div>', unsafe_allow_html=True)
-st.markdown('<div class="sub-header">An AI assistant that knows everything about Hyprland.</div>', unsafe_allow_html=True)
+# Main Application UI
+st.markdown('<div class="main-header">HyperAI Agent</div>', unsafe_allow_html=True)
+st.markdown('<div class="sub-header">Autonomous RAG & Multi-Query Search Assistant for Hyprland & Linux Systems</div>', unsafe_allow_html=True)
 
 active_chat = st.session_state.chats[st.session_state.active_chat_id]
 
+# Render Chat History
 for msg in active_chat["messages"]:
     with st.chat_message(msg["role"]):
         st.markdown(msg["content"])
         if "sources" in msg and msg["sources"]:
-            with st.expander("🔍 Sources Used for Response"):
+            with st.expander("🔍 Used Retrieval Sources"):
                 for doc, score in msg["sources"]:
                     tag = "📋 Table" if doc["is_table_row"] else "📄 Text"
                     st.markdown(f"**{tag}** — `{doc['topic']}` *(Similarity: {score:.3f})*")
                     st.code(doc["text"], language="markdown")
+        if "web_sources" in msg and msg["web_sources"]:
+            with st.expander("🌐 Web Research Sources"):
+                for meta in msg["web_sources"]:
+                    st.markdown(f"**[{meta['title']}]({meta['url']})** *(Query: `{meta['query']}`)*")
+                    st.caption(meta['snippet'])
 
-if user_prompt := st.chat_input("Ask anything about Hyprland or start chatting..."):
+# Chat Input Handler
+if user_prompt := st.chat_input("Ask about Hyprland, Linux distros, or request configurations..."):
     if len(active_chat["messages"]) == 0:
-        active_chat["title"] = user_prompt[:22] + ("..." if len(user_prompt) > 22 else "")
+        active_chat["title"] = user_prompt[:25] + ("..." if len(user_prompt) > 25 else "")
 
     active_chat["messages"].append({"role": "user", "content": user_prompt})
     with st.chat_message("user"):
@@ -235,38 +283,28 @@ if user_prompt := st.chat_input("Ask anything about Hyprland or start chatting..
 
     with st.chat_message("assistant"):
         results = []
-        expanded_terms = []
         web_context = ""
+        web_metadata = []
 
-        with st.status("⚡ Processing live workflow...", expanded=True) as status:
-            status.write(f"🧠 **Intent Analysis:** Evaluating query with Groq `{GROQ_INTENT_MODEL}`...")
-            should_search = check_intent_with_groq(user_prompt)
+        with st.status("🤖 Agent executing workflow...", expanded=True) as status:
+            # Step 1: Agent Decision Making
+            status.write("🧠 **Agent Router:** Analyzing intent and planning tool strategy...")
+            decision = agent_router(user_prompt, force_web=force_web_search)
+            status.write(f"💭 **Agent Reasoning:** *\"{decision.get('reasoning')}\"*")
 
-            if should_search:
-                status.write("🔍 **Result:** Technical query detected. Initiating vector lookup...")
+            # Step 2: Local RAG Retrieval (if requested)
+            if decision.get("need_local_rag", True):
+                status.write("🔍 **Tool Execution:** Searching local vector dataset...")
+                expanded_terms = decision.get("expanded_terms", [])
+                
+                if expanded_terms:
+                    status.write(f"💡 **Predicted Config Keys:** `{', '.join(expanded_terms)}`")
 
-                if use_expansion:
-                    status.write("🔍 **Step 1/3:** Predicting configuration terms via LLM...")
-                    try:
-                        exp_prompt = f"Hyprland config question: '{user_prompt}'. List relevant config parameters in English, comma-separated (e.g., border_size, gaps_in)."
-                        res = client.models.generate_content(
-                            model=GEN_MODEL, 
-                            contents=exp_prompt, 
-                            config=types.GenerateContentConfig(temperature=0.2)
-                        )
-                        expanded_terms = [t.strip() for t in res.text.split(",") if t.strip()]
-                        status.write(f"✓ Predicted terms: `{', '.join(expanded_terms)}`")
-                    except Exception:
-                        status.write("⚠️ Query expansion skipped.")
-
-                status.write("📐 **Step 2/3:** Converting query to vector space...")
                 q_text = "query: " + user_prompt + (" " + " ".join(expanded_terms) if expanded_terms else "")
                 q_emb = embedder.encode([q_text], convert_to_numpy=True)[0]
                 q_emb = q_emb / np.linalg.norm(q_emb)
 
-                status.write("🎯 **Step 3/3:** Searching vector database...")
                 scores = embeddings @ q_emb
-
                 keywords = set(re.findall(r'\b[a-zA-Z_]+(?:\.[a-zA-Z_]+)+\b', user_prompt) + re.findall(r'\b[a-zA-Z]+_[a-zA-Z_]+\b', user_prompt) + expanded_terms)
                 
                 exact_match_idx = []
@@ -287,17 +325,23 @@ if user_prompt := st.chat_input("Ask anything about Hyprland or start chatting..
                         final_idx.append(i)
 
                 results = [(documents[i], scores[i]) for i in final_idx]
+                status.write(f"✓ Retrieved **{len(results)}** local documentation chunks.")
 
-                if use_web_search:
-                    status.write("🌐 **Web Search:** Fetching real-time web results via DuckDuckGo...")
-                    web_context = search_web(user_prompt)
+            # Step 3: Dynamic Multi-Query Web Search (if requested)
+            if decision.get("need_web_search", False):
+                queries = decision.get("web_queries", [user_prompt])
+                status.write(f"🌐 **Tool Execution:** Initiating {len(queries)} dynamic web searches...")
+                
+                for idx, q in enumerate(queries, 1):
+                    status.write(f"   ↳ 🔎 Search Query {idx}/{len(queries)}: `{q}`")
+                
+                web_context, web_metadata = search_web_multi(queries, max_results_per_query=2)
+                status.write(f"✓ Collected **{len(web_metadata)}** unique live web snippets.")
 
-                status.update(label=f"🚀 Found {len(results)} local sources {'+ Web Context' if web_context else ''}. Generating response...", state="complete", expanded=False)
-            else:
-                status.write("💬 **Result:** Casual chat / greeting detected. Search skipped!")
-                status.update(label="🚀 Responding directly...", state="complete", expanded=False)
+            status.update(label="🚀 Synthesizing response...", state="complete", expanded=False)
 
-        local_context = "\n\n---\n\n".join([f"[Source: {doc['topic']}]\n{doc['text']}" for doc, _ in results]) if results else "No local wiki search performed."
+        # Step 4: Build Context and Stream Gemini Response
+        local_context = "\n\n---\n\n".join([f"[Source: {doc['topic']}]\n{doc['text']}" for doc, _ in results]) if results else "No local wiki context used."
         
         full_context = f"### Local Knowledge Base:\n{local_context}"
         if web_context:
@@ -308,27 +352,27 @@ if user_prompt := st.chat_input("Ask anything about Hyprland or start chatting..
             role_name = "User" if m["role"] == "user" else "Assistant"
             history_text += f"{role_name}: {m['content']}\n"
 
-        prompt = f"""You are HyperAI, a friendly, helpful, and knowledgeable assistant that knows everything about Hyprland.
-You are chatting with a user. Use a natural, clear, concise, and easy-to-understand tone.
+        system_prompt = f"""You are HyperAI, an expert system engineer and Hyprland assistant.
+You are interacting with the user. Use a clear, concise, well-formatted, and helpful tone.
 
 {full_context}
 
-### Conversation History:
+### Recent Conversation History:
 {history_text}
 
-### User's Message:
+### Current User Query:
 {user_prompt}
 
 ### Instructions:
-1. If the user greets, thanks, or engages in casual conversation, respond warmly and naturally in the language they used.
-2. For configuration or technical questions, utilize the Knowledge Base and Web Search Context if provided.
-3. Provide `hyprland.conf` code blocks whenever relevant.
+1. Respond naturally in the language used by the user (or English if technical standard).
+2. Use the provided Knowledge Base and Web Search Context to give accurate answers.
+3. Provide code blocks (e.g., `hyprland.conf`, bash scripts) whenever technical configuration is requested.
 """
 
         def stream_generator():
             response_stream = client.models.generate_content_stream(
                 model=GEN_MODEL,
-                contents=prompt,
+                contents=system_prompt,
                 config=types.GenerateContentConfig(temperature=temp_slider)
             )
             for chunk in response_stream:
@@ -338,22 +382,28 @@ You are chatting with a user. Use a natural, clear, concise, and easy-to-underst
         try:
             full_response = st.write_stream(stream_generator())
 
+            # Source Render Expanders
             if results:
-                with st.expander("🔍 Sources Used for Response"):
-                    if expanded_terms:
-                        st.info(f"💡 **Predicted Terms:** {', '.join(expanded_terms)}")
+                with st.expander("🔍 Used Retrieval Sources"):
                     for doc, score in results:
                         tag = "📋 Table Row" if doc["is_table_row"] else "📄 Text Block"
                         st.markdown(f"**{tag}** — `{doc['topic']}` *(Similarity: {score:.3f})*")
                         st.code(doc["text"], language="markdown")
 
+            if web_metadata:
+                with st.expander("🌐 Web Research Sources"):
+                    for meta in web_metadata:
+                        st.markdown(f"**[{meta['title']}]({meta['url']})** *(Query: `{meta['query']}`)*")
+                        st.caption(meta['snippet'])
+
             active_chat["messages"].append({
                 "role": "assistant",
                 "content": full_response,
-                "sources": results
+                "sources": results,
+                "web_sources": web_metadata
             })
 
         except APIError as e:
-            st.error(f"❌ API Error: {e}")
+            st.error(f"❌ Gemini API Error: {e}")
         except Exception as e:
             st.error(f"❌ Unexpected Error: {e}")
