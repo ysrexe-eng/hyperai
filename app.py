@@ -54,17 +54,23 @@ with st.sidebar:
     st.markdown("### 📊 Status")
     status_box = st.empty()
 
-def check_intent_with_llm(user_prompt: str, client_obj) -> bool:
+def check_intent(user_prompt: str, client_obj) -> bool:
     if not client_obj:
         return True
-        
-    prompt = f"""Analyze the user's message. Does this message require a Hyprland configuration, Linux settings, code snippet, troubleshooting, or technical wiki search?
 
-- If it requires a technical/configuration lookup, reply ONLY with: YES
-- If it is a greeting, thank you, casual chat, or follow-up conversation, reply ONLY with: NO
+    prompt = f"""Determine whether the user query requires searching a Hyprland Linux configuration/wiki database.
 
-User Message: "{user_prompt}"
-Response:"""
+Technical search required (YES):
+- Hyprland settings, window rules, keybindings, animations, decorations, input configurations, monitor setups, troubleshooting, or code snippets.
+
+No technical search required (NO):
+- Greetings (e.g., "selam", "hello", "hi"), salutations, casual chat, small talk, thanks, farewells, or general questions about identity/well-being.
+
+User Query: "{user_prompt}"
+
+Answer strictly with YES or NO.
+
+Answer:"""
 
     try:
         res = client_obj.models.generate_content(
@@ -182,11 +188,11 @@ if user_prompt := st.chat_input("Ask a question about Hyprland or start chatting
         expanded_terms = []
 
         with st.status("⚡ Processing live workflow...", expanded=True) as status:
-            status.write(f"🧠 **Intent Analysis:** Evaluating query with `{INTENT_MODEL}`...")
-            should_search = check_intent_with_llm(user_prompt, client)
+            status.write(f"🧠 **Intent Analysis:** Evaluating query intent with `{INTENT_MODEL}`...")
+            should_search = check_intent(user_prompt, client)
 
             if should_search:
-                status.write("🔍 **Result:** Technical search required. Starting embedding and vector lookup...")
+                status.write("🔍 **Result:** Technical query detected. Initiating vector lookup...")
 
                 if use_expansion:
                     status.write("🔍 **Step 1/3:** Predicting configuration terms via LLM...")
@@ -202,7 +208,7 @@ if user_prompt := st.chat_input("Ask a question about Hyprland or start chatting
                     except Exception:
                         status.write("⚠️ Query expansion skipped.")
 
-                status.write("📐 **Step 2/3:** Converting question to vector space (Embedding)...")
+                status.write("📐 **Step 2/3:** Converting query to vector space...")
                 q_text = "query: " + user_prompt + (" " + " ".join(expanded_terms) if expanded_terms else "")
                 q_emb = embedder.encode([q_text], convert_to_numpy=True)[0]
                 q_emb = q_emb / np.linalg.norm(q_emb)
@@ -232,10 +238,10 @@ if user_prompt := st.chat_input("Ask a question about Hyprland or start chatting
                 results = [(documents[i], scores[i]) for i in final_idx]
                 status.update(label=f"🚀 Found {len(results)} relevant sources. Generating response...", state="complete", expanded=False)
             else:
-                status.write("💬 **Result:** Casual chat / follow-up statement detected. Embedding skipped!")
+                status.write("💬 **Result:** Casual chat / greeting detected. Search skipped!")
                 status.update(label="🚀 Responding directly...", state="complete", expanded=False)
 
-        context = "\n\n---\n\n".join([f"[Source: {doc['topic']}]\n{doc['text']}" for doc, _ in results]) if results else "No search performed (Casual Chat)."
+        context = "\n\n---\n\n".join([f"[Source: {doc['topic']}]\n{doc['text']}" for doc, _ in results]) if results else "No technical search performed (Casual Chat)."
 
         history_text = ""
         for m in st.session_state.messages[-6:-1]:
@@ -255,7 +261,7 @@ You are chatting with a user. Use a natural, clear, concise, and easy-to-underst
 {user_prompt}
 
 ### Instructions:
-1. If the user greets, thanks, or engages in casual conversation, respond warmly and naturally.
+1. If the user greets, thanks, or engages in casual conversation, respond warmly and naturally in the language they used.
 2. For configuration or technical questions, utilize the Knowledge Base.
 3. Provide `hyprland.conf` code blocks whenever relevant.
 """
