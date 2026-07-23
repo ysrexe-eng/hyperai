@@ -20,7 +20,7 @@ st.title("🤖 Hyprland RAG Asistanı")
 st.caption("Gelişmiş Tablo Parsing & Semantik Arama Destekli")
 
 # API Key yönetimi (Secrets veya Manuel Girdi)
-api_key = os.getenv("GEMINI_API_KEY", "AQ.Ab8RN6KQRjeo4QPLMhY_y7EG7e5mdOi5HRwVWgbolRh9mdxW_A")
+api_key = os.getenv("GEMINI_API_KEY")
 
 GEN_MODEL = "gemma-4-31b-it"
 EMBED_MODEL_NAME = "intfloat/multilingual-e5-large"
