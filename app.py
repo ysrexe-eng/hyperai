@@ -6,6 +6,7 @@ os.environ["MKL_NUM_THREADS"] = "2"
 
 import json
 import re
+import uuid
 import numpy as np
 import streamlit as st
 import torch
@@ -14,11 +15,12 @@ from google import genai
 from google.genai import types
 from google.genai.errors import APIError
 from groq import Groq
+from duckduckgo_search import DDGS
 
 torch.set_num_threads(2)
 
 st.set_page_config(
-    page_title="Hyprland Config Assistant",
+    page_title="HyperAI",
     page_icon="⚡",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -44,13 +46,45 @@ SKIP_KEYWORDS = ["readme", "version-selector", "_index", "license"]
 API_KEY = st.secrets.get("GEMINI_API_KEY") or os.environ.get("GEMINI_API_KEY", "")
 GROQ_API_KEY = st.secrets.get("GROQ_API_KEY") or os.environ.get("GROQ_API_KEY", "")
 
+if "chats" not in st.session_state:
+    st.session_state.chats = {}
+    default_id = str(uuid.uuid4())
+    st.session_state.chats[default_id] = {"title": "New Chat", "messages": []}
+    st.session_state.active_chat_id = default_id
+
+if "active_chat_id" not in st.session_state or st.session_state.active_chat_id not in st.session_state.chats:
+    st.session_state.active_chat_id = list(st.session_state.chats.keys())[0]
+
 with st.sidebar:
-    st.title("⚡ Hyprland RAG")
+    st.title("⚡ HyperAI")
+    
+    if st.button("➕ New Chat", use_container_width=True):
+        new_id = str(uuid.uuid4())
+        st.session_state.chats[new_id] = {"title": f"Chat {len(st.session_state.chats) + 1}", "messages": []}
+        st.session_state.active_chat_id = new_id
+        st.rerun()
+
+    chat_options = {cid: data["title"] for cid, data in st.session_state.chats.items()}
+    chat_ids = list(chat_options.keys())
+    current_index = chat_ids.index(st.session_state.active_chat_id) if st.session_state.active_chat_id in chat_ids else 0
+
+    selected_chat_id = st.selectbox(
+        "Chat History",
+        options=chat_ids,
+        format_func=lambda cid: chat_options[cid],
+        index=current_index
+    )
+
+    if selected_chat_id != st.session_state.active_chat_id:
+        st.session_state.active_chat_id = selected_chat_id
+        st.rerun()
+
     st.markdown("---")
     
     top_k_slider = st.slider("Documents to Retrieve (Top K)", min_value=3, max_value=20, value=10)
     temp_slider = st.slider("Temperature", min_value=0.0, max_value=1.0, value=0.3, step=0.1)
     use_expansion = st.checkbox("Query Expansion", value=False, help="Uses LLM to predict additional configuration parameter names.")
+    use_web_search = st.checkbox("Web Search", value=False, help="Fetches live search results from DuckDuckGo.")
     
     st.markdown("---")
     st.markdown("### 📊 Status")
@@ -62,7 +96,7 @@ def check_intent_with_groq(user_prompt: str) -> bool:
 
     try:
         groq_client = Groq(api_key=GROQ_API_KEY)
-        prompt = f"""Determine whether the user query requires searching a Hyprland Linux configuration/wiki database.
+        prompt = f"""Determine whether the user query requires searching a Hyprland Linux configuration/wiki database or web context.
 
 Technical search required (YES):
 - Hyprland settings, window rules, keybindings, animations, decorations, input configurations, monitor setups, troubleshooting, or code snippets.
@@ -86,6 +120,18 @@ Answer:"""
         return "YES" in answer
     except Exception:
         return True
+
+def search_web(query: str, max_results: int = 3) -> str:
+    try:
+        results = list(DDGS().text(query, max_results=max_results))
+        if not results:
+            return ""
+        web_docs = []
+        for r in results:
+            web_docs.append(f"[Web Source: {r.get('title')}]\n{r.get('body')}\nURL: {r.get('href')}")
+        return "\n\n---\n\n".join(web_docs)
+    except Exception:
+        return ""
 
 @st.cache_resource
 def get_gemini_client(key):
@@ -163,13 +209,12 @@ except Exception as e:
     status_box.error(f"System Error: {e}")
     st.stop()
 
-st.markdown('<div class="main-header">Hyprland Config Assistant</div>', unsafe_allow_html=True)
-st.markdown('<div class="sub-header">AI assistant with Groq intent classification and live response streaming.</div>', unsafe_allow_html=True)
+st.markdown('<div class="main-header">HyperAI</div>', unsafe_allow_html=True)
+st.markdown('<div class="sub-header">An AI assistant that knows everything about Hyprland.</div>', unsafe_allow_html=True)
 
-if "messages" not in st.session_state:
-    st.session_state.messages = []
+active_chat = st.session_state.chats[st.session_state.active_chat_id]
 
-for msg in st.session_state.messages:
+for msg in active_chat["messages"]:
     with st.chat_message(msg["role"]):
         st.markdown(msg["content"])
         if "sources" in msg and msg["sources"]:
@@ -179,14 +224,18 @@ for msg in st.session_state.messages:
                     st.markdown(f"**{tag}** — `{doc['topic']}` *(Similarity: {score:.3f})*")
                     st.code(doc["text"], language="markdown")
 
-if user_prompt := st.chat_input("Ask a question about Hyprland or start chatting..."):
-    st.session_state.messages.append({"role": "user", "content": user_prompt})
+if user_prompt := st.chat_input("Ask anything about Hyprland or start chatting..."):
+    if len(active_chat["messages"]) == 0:
+        active_chat["title"] = user_prompt[:22] + ("..." if len(user_prompt) > 22 else "")
+
+    active_chat["messages"].append({"role": "user", "content": user_prompt})
     with st.chat_message("user"):
         st.markdown(user_prompt)
 
     with st.chat_message("assistant"):
         results = []
         expanded_terms = []
+        web_context = ""
 
         with st.status("⚡ Processing live workflow...", expanded=True) as status:
             status.write(f"🧠 **Intent Analysis:** Evaluating query with Groq `{GROQ_INTENT_MODEL}`...")
@@ -237,23 +286,31 @@ if user_prompt := st.chat_input("Ask a question about Hyprland or start chatting
                         final_idx.append(i)
 
                 results = [(documents[i], scores[i]) for i in final_idx]
-                status.update(label=f"🚀 Found {len(results)} relevant sources. Generating response...", state="complete", expanded=False)
+
+                if use_web_search:
+                    status.write("🌐 **Web Search:** Fetching real-time web results via DuckDuckGo...")
+                    web_context = search_web(user_prompt)
+
+                status.update(label=f"🚀 Found {len(results)} local sources {'+ Web Context' if web_context else ''}. Generating response...", state="complete", expanded=False)
             else:
                 status.write("💬 **Result:** Casual chat / greeting detected. Search skipped!")
                 status.update(label="🚀 Responding directly...", state="complete", expanded=False)
 
-        context = "\n\n---\n\n".join([f"[Source: {doc['topic']}]\n{doc['text']}" for doc, _ in results]) if results else "No technical search performed (Casual Chat)."
+        local_context = "\n\n---\n\n".join([f"[Source: {doc['topic']}]\n{doc['text']}" for doc, _ in results]) if results else "No local wiki search performed."
+        
+        full_context = f"### Local Knowledge Base:\n{local_context}"
+        if web_context:
+            full_context += f"\n\n### Web Search Context:\n{web_context}"
 
         history_text = ""
-        for m in st.session_state.messages[-6:-1]:
+        for m in active_chat["messages"][-6:-1]:
             role_name = "User" if m["role"] == "user" else "Assistant"
             history_text += f"{role_name}: {m['content']}\n"
 
-        prompt = f"""You are a friendly, helpful, and knowledgeable Hyprland Linux assistant.
+        prompt = f"""You are HyperAI, a friendly, helpful, and knowledgeable assistant that knows everything about Hyprland.
 You are chatting with a user. Use a natural, clear, concise, and easy-to-understand tone.
 
-### Knowledge Base (Wiki Sources):
-{context}
+{full_context}
 
 ### Conversation History:
 {history_text}
@@ -263,7 +320,7 @@ You are chatting with a user. Use a natural, clear, concise, and easy-to-underst
 
 ### Instructions:
 1. If the user greets, thanks, or engages in casual conversation, respond warmly and naturally in the language they used.
-2. For configuration or technical questions, utilize the Knowledge Base.
+2. For configuration or technical questions, utilize the Knowledge Base and Web Search Context if provided.
 3. Provide `hyprland.conf` code blocks whenever relevant.
 """
 
@@ -289,7 +346,7 @@ You are chatting with a user. Use a natural, clear, concise, and easy-to-underst
                         st.markdown(f"**{tag}** — `{doc['topic']}` *(Similarity: {score:.3f})*")
                         st.code(doc["text"], language="markdown")
 
-            st.session_state.messages.append({
+            active_chat["messages"].append({
                 "role": "assistant",
                 "content": full_response,
                 "sources": results
