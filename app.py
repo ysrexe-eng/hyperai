@@ -16,14 +16,13 @@ from sentence_transformers import SentenceTransformer
 from google import genai
 from google.genai import types
 from google.genai.errors import APIError
-from groq import Groq
 from ddgs import DDGS
 
 torch.set_num_threads(2)
 
 # Page Configuration
 st.set_page_config(
-    page_title="HyperAI - Iterative Agentic RAG",
+    page_title="HyperAI - Gemma-Powered Agentic RAG",
     page_icon="⚡",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -40,7 +39,6 @@ st.markdown("""
 
 # Configuration Constants
 GEN_MODEL = "gemma-4-31b-it"
-GROQ_INTENT_MODEL = "llama-3.1-8b-instant"
 EMBED_MODEL_NAME = "intfloat/multilingual-e5-large"
 INPUT_PATH = "hyprland_dataset.json"
 CACHE_PATH = "rag_cache.npz"
@@ -50,7 +48,6 @@ SKIP_KEYWORDS = ["readme", "version-selector", "_index", "license"]
 
 # API Keys Initialization
 API_KEY = st.secrets.get("GEMINI_API_KEY") or os.environ.get("GEMINI_API_KEY", "")
-GROQ_API_KEY = st.secrets.get("GROQ_API_KEY") or os.environ.get("GROQ_API_KEY", "")
 
 # Session State Initialization
 if "chats" not in st.session_state:
@@ -97,11 +94,15 @@ with st.sidebar:
     status_box = st.empty()
 
 # -----------------------------------------------------------------------------
-# Core Tools
+# Core Tools & Gemma Router
 # -----------------------------------------------------------------------------
 
+@st.cache_resource
+def get_gemini_client(key):
+    return genai.Client(api_key=key) if key else None
+
 def scrape_url(url: str, timeout: int = 6) -> str:
-    """Scrapes clean text from a given web page."""
+    """Scrapes clean text from a web page."""
     try:
         headers = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"}
         response = requests.get(url, headers=headers, timeout=timeout)
@@ -132,55 +133,47 @@ def search_web_multi(queries: list[str], max_results: int = 2) -> tuple[str, lis
             continue
     return "\n\n---\n\n".join(docs), metadata
 
-def agent_next_step(user_prompt: str, context_summary: str, tools_used: list[str]) -> dict:
-    """Iterative Router (ReAct Loop): Evaluates current gathered context and picks the next best tool."""
-    if not GROQ_API_KEY:
-        return {"next_action": "finish", "reasoning": "Groq API key missing. Finishing execution."}
-
-    extracted_urls = re.findall(r'https?://[^\s]+', user_prompt)
-
-    prompt = f"""You are an Autonomous ReAct Agent for a Hyprland & Linux System Assistant.
-Your goal is to iteratively decide what tool to use next to thoroughly answer the user.
+def gemma_agent_router(client_genai, user_prompt: str, context_summary: str, tools_used: list[str]) -> dict:
+    """Uses Gemma model as the core Router Reasoning Engine."""
+    prompt = f"""You are an Autonomous AI Router Agent powered by Gemma for a Hyprland & Linux System Assistant.
+Your task is to analyze the user query and decide what tool to execute next.
 
 User Query: "{user_prompt}"
-Tools Already Executed: {json.dumps(tools_used)}
-Current Gathered Context Summary:
-"{context_summary if context_summary else 'No context gathered yet.'}"
+Tools Executed So Far: {json.dumps(tools_used)}
+Current Summary of Gathered Information:
+"{context_summary if context_summary else 'No information gathered yet.'}"
 
-RULES:
-1. If the query is simple greeting/casual talk ("selam", "hi", "thanks"), IMMEDIATELY select "finish".
-2. If context is empty and tools_used does NOT contain "local_rag", you can start with "local_rag".
-3. If context lacks sufficient external/distro/troubleshooting info, use "web_search" (generate 2 distinct English queries).
-4. If a URL is present or external doc scraping is needed, use "web_scrape".
-5. If gathered context is ALREADY sufficient or maximum steps reached, choose "finish".
+STRICT DECISION RULES:
+1. GREETINGS & SMALL TALK: If user says casual things ("selam", "hi", "merhaba", "eyvallah"), IMMEDIATELY choose "finish". Do not use any tools!
+2. LOCAL RAG: Choose "local_rag" if technical Hyprland/config details are needed and "local_rag" is NOT in Tools Executed.
+3. WEB SEARCH: Choose "web_search" ONLY if query needs live info, distros (CachyOS, Arch, etc.), or external tools not found locally.
+4. WEB SCRAPE: Choose "web_scrape" ONLY if a URL is explicitly provided in prompt or specific link reading is needed.
+5. FINISH: Choose "finish" if gathered info is sufficient to answer completely.
 
-Available Actions: "local_rag", "web_search", "web_scrape", "finish"
+Available actions: "local_rag", "web_search", "web_scrape", "finish"
 
-Return ONLY valid JSON matching this schema:
+Output JSON matching schema:
 {{
     "next_action": "local_rag" | "web_search" | "web_scrape" | "finish",
-    "reasoning": "Why this action is taken based on current findings",
-    "web_queries": ["query 1", "query 2"],
+    "reasoning": "Clear explanation of why this step was chosen",
+    "web_queries": ["query 1 in english", "query 2 in english"],
     "scrape_urls": ["https://..."],
     "expanded_terms": ["term1", "term2"]
 }}
 """
 
     try:
-        groq_client = Groq(api_key=GROQ_API_KEY)
-        res = groq_client.chat.completions.create(
-            messages=[{"role": "user", "content": prompt}],
-            model=GROQ_INTENT_MODEL,
-            temperature=0.0,
-            response_format={"type": "json_object"}
+        res = client_genai.models.generate_content(
+            model=GEN_MODEL,
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                temperature=0.0,
+                response_mime_type="application/json"
+            )
         )
-        return json.loads(res.choices[0].message.content)
+        return json.loads(res.text)
     except Exception as e:
-        return {"next_action": "finish", "reasoning": f"Step routing error ({e}). Finishing context collection."}
-
-@st.cache_resource
-def get_gemini_client(key):
-    return genai.Client(api_key=key) if key else None
+        return {"next_action": "finish", "reasoning": f"Gemma Router error ({e}). Proceeding to answer."}
 
 @st.cache_resource
 def load_embedder():
@@ -244,14 +237,14 @@ try:
     embedder = load_embedder()
     documents, embeddings = load_data_and_cache()
     client = get_gemini_client(API_KEY)
-    status_box.success(f"✅ Ready! ({len(embeddings)} RAG vectors active)")
+    status_box.success(f"✅ Gemma Agent Active! ({len(embeddings)} RAG vectors loaded)")
 except Exception as e:
     status_box.error(f"Initialization Error: {e}")
     st.stop()
 
 # Main Application UI
 st.markdown('<div class="main-header">HyperAI Agent</div>', unsafe_allow_html=True)
-st.markdown('<div class="sub-header">Iterative ReAct Agent with Multi-Tool Reflection</div>', unsafe_allow_html=True)
+st.markdown('<div class="sub-header">Gemma-4-31B Powered Autonomous ReAct Agent</div>', unsafe_allow_html=True)
 
 active_chat = st.session_state.chats[st.session_state.active_chat_id]
 
@@ -288,20 +281,20 @@ if user_prompt := st.chat_input("Ask a question, request a config, or paste a li
         tools_executed = []
         context_accumulator = []
 
-        # Step-by-Step Iterative Agent Execution Loop
-        with st.status("🤖 Agent thinking & executing tool chain...", expanded=True) as status:
+        # Step-by-Step Gemma Reasoning Loop
+        with st.status("🧠 Gemma Reasoning Engine thinking...", expanded=True) as status:
             max_steps = 3
             for step in range(1, max_steps + 1):
                 summary_str = " | ".join(context_accumulator)[:1000]
-                decision = agent_next_step(user_prompt, summary_str, tools_executed)
+                decision = gemma_agent_router(client, user_prompt, summary_str, tools_executed)
                 
                 action = decision.get("next_action", "finish")
                 reasoning = decision.get("reasoning", "")
 
-                status.write(f"🧠 **Step {step} Reasoning:** *\"{reasoning}\"*")
+                status.write(f"💭 **Gemma Step {step}:** *\"{reasoning}\"*")
 
                 if action == "finish":
-                    status.write("✅ **Agent Evaluation:** Context collection complete. Proceeding to synthesis.")
+                    status.write("✅ **Gemma Decision:** Sufficient reasoning completed. Generating response.")
                     break
 
                 # Tool 1: Local Vector RAG
@@ -373,7 +366,7 @@ if user_prompt := st.chat_input("Ask a question, request a config, or paste a li
 
         system_prompt = f"""You are HyperAI, an expert system engineer and Hyprland assistant.
 
-Gathered Multi-Tool Context:
+Gathered Context:
 {full_context if full_context else "No external context used."}
 
 Recent Conversation History:
@@ -383,8 +376,8 @@ User Query:
 {user_prompt}
 
 Instructions:
-1. If the query is casual conversation, respond naturally without technical jargon.
-2. For technical requests, leverage the gathered context to provide complete, precise answers and code blocks.
+1. If user query is a casual greeting, respond naturally without technical jargon.
+2. For technical requests, leverage context to provide precise answers and config blocks.
 """
 
         def stream_generator():
