@@ -1,6 +1,6 @@
 import os
 
-# 1. Streamlit dosya izleyicisini ve PyTorch kilitlenmelerini en başta devre dışı bırakıyoruz
+# 1. Streamlit watcher & PyTorch thread optimizasyonları (Sistem kasmasını önler)
 os.environ["STREAMLIT_WATCHER_TYPE"] = "none"
 os.environ["OMP_NUM_THREADS"] = "2"
 os.environ["MKL_NUM_THREADS"] = "2"
@@ -21,7 +21,7 @@ torch.set_num_threads(2)
 # 2. Sayfa Yapılandırması ve Stiller
 # ---------------------------------------------------------------
 st.set_page_config(
-    page_title="Hyprland Config Assistant",
+    page_title="Hyprland Config Asistanı",
     page_icon="⚡",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -44,31 +44,22 @@ CHUNK_OVERLAP = 120
 SKIP_KEYWORDS = ["readme", "version-selector", "_index", "license"]
 
 # ---------------------------------------------------------------
-# 3. Sol Yan Panel (Sidebar) & API Key Yönetimi
+# 3. API Key Yönetimi (Arayüzde GÖSTERİLMEZ)
 # ---------------------------------------------------------------
+API_KEY = st.secrets.get("GEMINI_API_KEY") or os.environ.get("GEMINI_API_KEY", "")
+
+# Sol Yan Panel
 with st.sidebar:
     st.title("⚡ Hyprland RAG")
     st.markdown("---")
     
-    # Secrets varsa oradan oku, yoksa boş string ver
-    secret_key = st.secrets.get("GEMINI_API_KEY", "") if "GEMINI_API_KEY" in st.secrets else ""
-    
-    api_key_input = st.text_input(
-        "Gemini API Key", 
-        value=secret_key, 
-        type="password",
-        placeholder="AIzaSy...",
-        help="Google AI Studio'dan aldığınız API Key'i girin (AIzaSy... ile başlar)."
-    )
-    
     top_k_slider = st.slider("Getirilecek Doküman (Top K)", min_value=3, max_value=20, value=10)
     temp_slider = st.slider("Sıcaklık (Temperature)", min_value=0.0, max_value=1.0, value=0.3, step=0.1)
+    use_expansion = st.checkbox("Gelişmiş Arama (Query Expansion)", value=False, help="LLM ile ekstra ayar isimleri tahmin eder. Aramayı bir tık yavaşlatabilir.")
     
     st.markdown("---")
     st.markdown("### 📊 Durum")
     status_box = st.empty()
-
-active_api_key = api_key_input.strip()
 
 # ---------------------------------------------------------------
 # 4. Önbelleğe Alınmış Yüklemeler
@@ -107,7 +98,7 @@ def load_data_and_cache():
         return chunks
 
     if not os.path.exists(INPUT_PATH):
-        st.error(f"❌ '{INPUT_PATH}' dosyası bulunamadı!")
+        st.error(f"❌ '{INPUT_PATH}' bulunamadı!")
         st.stop()
 
     with open(INPUT_PATH, "r", encoding="utf-8") as f:
@@ -127,7 +118,7 @@ def load_data_and_cache():
                 documents.append({"topic": topic, "text": chunk, "is_table_row": False})
 
     if not os.path.exists(CACHE_PATH):
-        st.error(f"❌ '{CACHE_PATH}' dosyası bulunamadı! Lütfen repoya push'ladığından emin ol.")
+        st.error(f"❌ Önbellek dosyası '{CACHE_PATH}' bulunamadı! Lütfen GitHub repana ekle.")
         st.stop()
 
     cache = np.load(CACHE_PATH, allow_pickle=True)
@@ -135,29 +126,28 @@ def load_data_and_cache():
 
     return documents, embeddings
 
-# Modelleri Yükle
+# Başlatma
+if not API_KEY:
+    status_box.error("❌ GEMINI_API_KEY bulunamadı!")
+    st.error("🔑 API Key eksik. Lütfen Streamlit Cloud Secrets alanına `GEMINI_API_KEY` tanımını ekleyin.")
+    st.stop()
+
 try:
     embedder = load_embedder()
     documents, embeddings = load_data_and_cache()
-    client = get_gemini_client(active_api_key) if active_api_key else None
-    
-    if active_api_key:
-        status_box.success(f"✅ Hazır! ({len(embeddings)} embedding cache'den yüklendi)")
-    else:
-        status_box.warning("⚠️ Lütfen sol panelden geçerli bir Gemini API Key girin.")
+    client = get_gemini_client(API_KEY)
+    status_box.success(f"✅ Hazır! ({len(embeddings)} embedding aktif)")
 except Exception as e:
-    status_box.error(f"Yükleme hatası: {e}")
+    status_box.error(f"Sistem Hatası: {e}")
     st.stop()
 
 # ---------------------------------------------------------------
 # 5. Arama Fonksiyonları
 # ---------------------------------------------------------------
-def expand_query(question, client_obj):
-    if not client_obj:
-        return []
+def expand_query(question):
     prompt = f"Hyprland config sorusu: '{question}'. İlgili config parametrelerini İngilizce, virgülle ayırarak yaz (örn: border_size, gaps_in)."
     try:
-        res = client_obj.models.generate_content(
+        res = client.models.generate_content(
             model=GEN_MODEL, 
             contents=prompt, 
             config=types.GenerateContentConfig(temperature=0.2)
@@ -166,8 +156,8 @@ def expand_query(question, client_obj):
     except Exception:
         return []
 
-def retrieve(question, top_k, client_obj):
-    expanded = expand_query(question, client_obj)
+def retrieve(question, top_k, enable_expansion):
+    expanded = expand_query(question) if enable_expansion else []
     q_text = "query: " + question + (" " + " ".join(expanded) if expanded else "")
     
     q_emb = embedder.encode([q_text], convert_to_numpy=True)[0]
@@ -196,15 +186,15 @@ def retrieve(question, top_k, client_obj):
     return [(documents[i], scores[i]) for i in final_idx], expanded
 
 # ---------------------------------------------------------------
-# 6. Chat Arayüzü
+# 6. Chat Arayüzü & Streaming
 # ---------------------------------------------------------------
 st.markdown('<div class="main-header">Hyprland Config Asistanı</div>', unsafe_allow_html=True)
-st.markdown('<div class="sub-header">NPZ Önbellek destekli hızlı RAG asistanı.</div>', unsafe_allow_html=True)
+st.markdown('<div class="sub-header">Canlı yanıt akışlı sohbet asistanı.</div>', unsafe_allow_html=True)
 
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
-# Geçmiş Sohbet
+# Geçmiş Sohbet Ekranı
 for msg in st.session_state.messages:
     with st.chat_message(msg["role"]):
         st.markdown(msg["content"])
@@ -215,59 +205,73 @@ for msg in st.session_state.messages:
                     st.markdown(f"**{tag}** — `{doc['topic']}` *(Benzerlik: {score:.3f})*")
                     st.code(doc["text"], language="markdown")
 
-# Yeni Soru
-if user_prompt := st.chat_input("Hyprland ayarları hakkında bir soru sorun..."):
-    if not active_api_key:
-        st.error("🔑 Soru sormadan önce lütfen sol taraftaki panelden geçerli bir **Gemini API Key** girin!")
-        st.stop()
-
+# Yeni Mesaj Girişi
+if user_prompt := st.chat_input("Hyprland hakkında bir şey sor veya sohbet et..."):
     st.session_state.messages.append({"role": "user", "content": user_prompt})
     with st.chat_message("user"):
         st.markdown(user_prompt)
 
     with st.chat_message("assistant"):
-        with st.spinner("Wiki taranıyor ve yanıt üretiliyor..."):
-            results, expanded_terms = retrieve(user_prompt, top_k_slider, client)
-            
-            context = "\n\n---\n\n".join([f"[Kaynak: {doc['topic']}]\n{doc['text']}" for doc, _ in results])
-            
-            prompt = f"""Aşağıdaki Hyprland wiki kaynaklarını kullanarak kullanıcının sorusunu cevapla.
-SADECE verilen kaynaklardaki bilgiyi kullan, uydurma bilgi ekleme.
+        # Arama Adımı
+        results, expanded_terms = retrieve(user_prompt, top_k_slider, use_expansion)
+        context = "\n\n---\n\n".join([f"[Kaynak: {doc['topic']}]\n{doc['text']}" for doc, _ in results])
 
-### Kaynaklar:
+        # Sohbet Geçmişi (Hafıza)
+        history_text = ""
+        for m in st.session_state.messages[-6:-1]:
+            role_name = "Kullanıcı" if m["role"] == "user" else "Asistan"
+            history_text += f"{role_name}: {m['content']}\n"
+
+        prompt = f"""Sen arkadaş canlısı, samimi ve bilgili bir Hyprland Linux asistanısın.
+Kullanıcıyla sohbet ediyorsun. Doğal, akıcı, net ve anlaşılır bir dil kullan.
+
+### Bilgi Bankası (Wiki Kaynakları):
 {context}
 
-### Soru:
-{user_prompt}"""
+### Önceki Konuşma Geçmişi:
+{history_text}
 
-            try:
-                res = client.models.generate_content(
-                    model=GEN_MODEL,
-                    contents=prompt,
-                    config=types.GenerateContentConfig(temperature=temp_slider)
-                )
-                bot_response = res.text
+### Kullanıcının Mesajı:
+{user_prompt}
 
-                st.markdown(bot_response)
+### Talimatlar:
+1. Eğer kullanıcı selam veriyor, teşekkür ediyor veya sohbet ediyorsa dostça karşılık ver.
+2. Konfigürasyon veya teknik konularda Bilgi Bankası'ndaki verilerden faydalan.
+3. Gerekli yerlerde `hyprland.conf` kod blokları paylaş.
+"""
 
-                with st.expander("🔍 Yanıt İçin Kullanılan Kaynaklar"):
-                    if expanded_terms:
-                        st.info(f"💡 **Tahmin Edilen Config Terimleri:** {', '.join(expanded_terms)}")
-                    for doc, score in results:
-                        tag = "📋 Tablo Satırı" if doc["is_table_row"] else "📄 Metin Bloğu"
-                        st.markdown(f"**{tag}** — `{doc['topic']}` *(Benzerlik: {score:.3f})*")
-                        st.code(doc["text"], language="markdown")
+        # Stream jeneratörü
+        def stream_generator():
+            response_stream = client.models.generate_content_stream(
+                model=GEN_MODEL,
+                contents=prompt,
+                config=types.GenerateContentConfig(temperature=temp_slider)
+            )
+            for chunk in response_stream:
+                if chunk.text:
+                    yield chunk.text
 
-                st.session_state.messages.append({
-                    "role": "assistant",
-                    "content": bot_response,
-                    "sources": results
-                })
+        try:
+            # Cevabı ekrana kelime kelime akıt
+            full_response = st.write_stream(stream_generator())
 
-            except APIError as e:
-                if "401" in str(e) or "UNAUTHENTICATED" in str(e):
-                    st.error("❌ **Hata (401 Yetkisiz Erişim):** API Key geçersiz! [Google AI Studio](https://aistudio.google.com/apikey) adresinden `AIzaSy...` ile başlayan yeni bir key alıp sol panele yapıştırın.")
-                else:
-                    st.error(f"❌ **Gemini API Hatası:** {e}")
-            except Exception as e:
-                st.error(f"❌ **Hata:** {e}")
+            # Kaynak Detay Menüsü
+            with st.expander("🔍 Yanıt İçin Taranan Kaynaklar"):
+                if expanded_terms:
+                    st.info(f"💡 **Tahmin Edilen Terimler:** {', '.join(expanded_terms)}")
+                for doc, score in results:
+                    tag = "📋 Tablo Satırı" if doc["is_table_row"] else "📄 Metin Bloğu"
+                    st.markdown(f"**{tag}** — `{doc['topic']}` *(Benzerlik: {score:.3f})*")
+                    st.code(doc["text"], language="markdown")
+
+            # Hafızaya Kaydet
+            st.session_state.messages.append({
+                "role": "assistant",
+                "content": full_response,
+                "sources": results
+            })
+
+        except APIError as e:
+            st.error(f"❌ API Hatası: {e}")
+        except Exception as e:
+            st.error(f"❌ Beklenmeyen Hata: {e}")
