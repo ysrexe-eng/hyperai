@@ -1,9 +1,7 @@
 streamlit
-sentence-transformers
+fastembed
 google-genai
 numpy
-groq
-ddgs
 requests
 beautifulsoup4
-fastembed==0.5.1
+ddgs
