@@ -13,6 +13,7 @@ from sentence_transformers import SentenceTransformer
 from google import genai
 from google.genai import types
 from google.genai.errors import APIError
+from groq import Groq
 
 torch.set_num_threads(2)
 
@@ -32,7 +33,7 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 GEN_MODEL = "gemma-4-31b-it"
-INTENT_MODEL = "gemma-4-26b-a4b-it"
+GROQ_INTENT_MODEL = "llama-3.1-8b-instant"
 EMBED_MODEL_NAME = "intfloat/multilingual-e5-large"
 INPUT_PATH = "hyprland_dataset.json"
 CACHE_PATH = "rag_cache.npz"
@@ -41,6 +42,7 @@ CHUNK_OVERLAP = 120
 SKIP_KEYWORDS = ["readme", "version-selector", "_index", "license"]
 
 API_KEY = st.secrets.get("GEMINI_API_KEY") or os.environ.get("GEMINI_API_KEY", "")
+GROQ_API_KEY = st.secrets.get("GROQ_API_KEY") or os.environ.get("GROQ_API_KEY", "")
 
 with st.sidebar:
     st.title("⚡ Hyprland RAG")
@@ -54,11 +56,13 @@ with st.sidebar:
     st.markdown("### 📊 Status")
     status_box = st.empty()
 
-def check_intent(user_prompt: str, client_obj) -> bool:
-    if not client_obj:
+def check_intent_with_groq(user_prompt: str) -> bool:
+    if not GROQ_API_KEY:
         return True
 
-    prompt = f"""Determine whether the user query requires searching a Hyprland Linux configuration/wiki database.
+    try:
+        groq_client = Groq(api_key=GROQ_API_KEY)
+        prompt = f"""Determine whether the user query requires searching a Hyprland Linux configuration/wiki database.
 
 Technical search required (YES):
 - Hyprland settings, window rules, keybindings, animations, decorations, input configurations, monitor setups, troubleshooting, or code snippets.
@@ -72,16 +76,13 @@ Answer strictly with YES or NO.
 
 Answer:"""
 
-    try:
-        res = client_obj.models.generate_content(
-            model=INTENT_MODEL,
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                temperature=0.0,
-                max_output_tokens=5
-            )
+        res = groq_client.chat.completions.create(
+            messages=[{"role": "user", "content": prompt}],
+            model=GROQ_INTENT_MODEL,
+            temperature=0.0,
+            max_tokens=5,
         )
-        answer = res.text.strip().upper()
+        answer = res.choices[0].message.content.strip().upper()
         return "YES" in answer
     except Exception:
         return True
@@ -163,7 +164,7 @@ except Exception as e:
     st.stop()
 
 st.markdown('<div class="main-header">Hyprland Config Assistant</div>', unsafe_allow_html=True)
-st.markdown('<div class="sub-header">AI assistant with intent detection and live response streaming.</div>', unsafe_allow_html=True)
+st.markdown('<div class="sub-header">AI assistant with Groq intent classification and live response streaming.</div>', unsafe_allow_html=True)
 
 if "messages" not in st.session_state:
     st.session_state.messages = []
@@ -188,8 +189,8 @@ if user_prompt := st.chat_input("Ask a question about Hyprland or start chatting
         expanded_terms = []
 
         with st.status("⚡ Processing live workflow...", expanded=True) as status:
-            status.write(f"🧠 **Intent Analysis:** Evaluating query intent with `{INTENT_MODEL}`...")
-            should_search = check_intent(user_prompt, client)
+            status.write(f"🧠 **Intent Analysis:** Evaluating query with Groq `{GROQ_INTENT_MODEL}`...")
+            should_search = check_intent_with_groq(user_prompt)
 
             if should_search:
                 status.write("🔍 **Result:** Technical query detected. Initiating vector lookup...")
