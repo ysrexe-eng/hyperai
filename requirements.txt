@@ -6,4 +6,4 @@ groq
 ddgs
 requests
 beautifulsoup4
-fastembed
+fastembed==0.5.1
