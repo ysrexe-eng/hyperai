@@ -1,28 +1,24 @@
 import os
-
-os.environ["STREAMLIT_WATCHER_TYPE"] = "none"
-os.environ["OMP_NUM_THREADS"] = "2"
-os.environ["MKL_NUM_THREADS"] = "2"
-
-import json
 import re
+import json
 import uuid
+import time
+import queue
+import threading
+from concurrent.futures import ThreadPoolExecutor
+from collections import deque
 import numpy as np
 import requests
 from bs4 import BeautifulSoup
 import streamlit as st
-import torch
-from sentence_transformers import SentenceTransformer
+from fastembed import TextEmbedding
 from google import genai
 from google.genai import types
-from google.genai.errors import APIError
 from ddgs import DDGS
 
-torch.set_num_threads(2)
-
-# Page Configuration
+# Streamlit Page Config
 st.set_page_config(
-    page_title="HyperAI - Gemma-Powered Agentic RAG",
+    page_title="HyperAI - High-Concurrency Agentic RAG",
     page_icon="⚡",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -32,152 +28,136 @@ st.set_page_config(
 st.markdown("""
 <style>
     .stApp { background-color: #0e1117; }
-    .main-header { font-size: 2.2rem; font-weight: 700; color: #58a6ff; margin-bottom: 0.2rem; }
-    .sub-header { font-size: 0.95rem; color: #8b949e; margin-bottom: 1.5rem; }
+    .main-header { font-size: 2rem; font-weight: 700; color: #58a6ff; margin-bottom: 0.2rem; }
+    .sub-header { font-size: 0.9rem; color: #8b949e; margin-bottom: 1.2rem; }
+    .cache-badge { background-color: #238636; color: white; padding: 2px 8px; border-radius: 12px; font-size: 0.8rem; }
 </style>
 """, unsafe_allow_html=True)
 
 # Configuration Constants
 GEN_MODEL = "gemma-4-31b-it"
-EMBED_MODEL_NAME = "intfloat/multilingual-e5-large"
+EMBED_MODEL_NAME = "BAAI/bge-small-en-v1.5" # ONNX Tabanlı Aşırı Hızlı Embedding
 INPUT_PATH = "hyprland_dataset.json"
 CACHE_PATH = "rag_cache.npz"
 CHUNK_SIZE = 500
 CHUNK_OVERLAP = 120
 SKIP_KEYWORDS = ["readme", "version-selector", "_index", "license"]
 
-# API Keys Initialization
-API_KEY = st.secrets.get("GEMINI_API_KEY") or os.environ.get("GEMINI_API_KEY", "")
+# -----------------------------------------------------------------------------
+# 1. Global Thread-Safe API Key Pool (50+ User Capacity)
+# -----------------------------------------------------------------------------
 
-# Session State Initialization
-if "chats" not in st.session_state:
-    st.session_state.chats = {}
-    default_id = str(uuid.uuid4())
-    st.session_state.chats[default_id] = {"title": "New Session", "messages": []}
-    st.session_state.active_chat_id = default_id
+class GlobalKeyPool:
+    """Tüm eşzamanlı oturumlar arasında güvenle paylaşılan API key rotatörü."""
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.keys = self._discover_keys()
+        self.active_index = 0
 
-if "active_chat_id" not in st.session_state or st.session_state.active_chat_id not in st.session_state.chats:
-    st.session_state.active_chat_id = list(st.session_state.chats.keys())[0]
+    def _discover_keys(self) -> list[str]:
+        keys = []
+        if "GEMINI_API_KEYS" in st.secrets:
+            val = st.secrets["GEMINI_API_KEYS"]
+            if isinstance(val, list):
+                keys.extend(val)
+            elif isinstance(val, str):
+                keys.extend([k.strip() for k in val.split(",") if k.strip()])
 
-# Sidebar Interface
-with st.sidebar:
-    st.title("⚡ HyperAI Agent")
-    
-    if st.button("➕ New Chat", use_container_width=True):
-        new_id = str(uuid.uuid4())
-        st.session_state.chats[new_id] = {"title": f"Chat {len(st.session_state.chats) + 1}", "messages": []}
-        st.session_state.active_chat_id = new_id
-        st.rerun()
+        for source in [st.secrets, os.environ]:
+            for k, v in source.items():
+                if (k == "GEMINI_API_KEY" or k.startswith("GEMINI_API_KEY_")) and isinstance(v, str) and v.strip():
+                    keys.append(v.strip())
 
-    chat_options = {cid: data["title"] for cid, data in st.session_state.chats.items()}
-    chat_ids = list(chat_options.keys())
-    current_index = chat_ids.index(st.session_state.active_chat_id) if st.session_state.active_chat_id in chat_ids else 0
+        # Unique keys
+        res = []
+        for k in keys:
+            if k and k not in res:
+                res.append(k)
+        return res
 
-    selected_chat_id = st.selectbox(
-        "Session History",
-        options=chat_ids,
-        format_func=lambda cid: chat_options[cid],
-        index=current_index
-    )
+    def get_client(self) -> genai.Client | None:
+        with self.lock:
+            if not self.keys:
+                return None
+            return genai.Client(api_key=self.keys[self.active_index])
 
-    if selected_chat_id != st.session_state.active_chat_id:
-        st.session_state.active_chat_id = selected_chat_id
-        st.rerun()
+    def rotate_on_limit(self) -> bool:
+        with self.lock:
+            if len(self.keys) <= 1:
+                return False
+            old_idx = self.active_index
+            self.active_index = (self.active_index + 1) % len(self.keys)
+            return True
 
-    st.markdown("---")
-    st.markdown("### 🎛️ Agent Settings")
-    top_k_slider = st.slider("Max RAG Documents", min_value=3, max_value=20, value=8)
-    temp_slider = st.slider("Model Temperature", min_value=0.0, max_value=1.0, value=0.3, step=0.1)
-    
-    st.markdown("---")
-    st.markdown("### 📊 System Status")
-    status_box = st.empty()
+    @property
+    def status_info(self) -> str:
+        with self.lock:
+            if not self.keys:
+                return "❌ API Key Bulunamadı"
+            return f"🔑 Havuzdaki Key Sayısı: {len(self.keys)} | Aktif Key: #{self.active_index + 1}"
+
+@st.cache_resource
+def get_global_key_pool():
+    return GlobalKeyPool()
 
 # -----------------------------------------------------------------------------
-# Core Tools & Gemma Router
+# 2. Thread-Safe Semantic Cache (Benzer Soru Önbelleği)
+# -----------------------------------------------------------------------------
+
+class SemanticCache:
+    """Anlamca benzeyen soruları 0 ms'de yanıtlamak için bellek içi önbellek."""
+    def __init__(self, threshold: float = 0.90):
+        self.lock = threading.Lock()
+        self.threshold = threshold
+        self.cache = [] # List of dicts: {"vector": np.array, "response": str, "sources": list}
+
+    def search(self, query_vector: np.ndarray):
+        with self.lock:
+            if not self.cache:
+                return None, 0.0
+
+            # Normalize query vector
+            q_norm = query_vector / np.linalg.norm(query_vector)
+
+            for item in self.cache:
+                c_norm = item["vector"] / np.linalg.norm(item["vector"])
+                similarity = float(np.dot(q_norm, c_norm))
+
+                if similarity >= self.threshold:
+                    return item, similarity
+
+            return None, 0.0
+
+    def add(self, query_vector: np.ndarray, response: str, sources: list):
+        with self.lock:
+            # Önbellekte maksimum 500 yanıt tut (Bellek şişmesini önle)
+            if len(self.cache) >= 500:
+                self.cache.pop(0)
+
+            self.cache.append({
+                "vector": query_vector,
+                "response": response,
+                "sources": sources,
+                "timestamp": time.time()
+            })
+
+@st.cache_resource
+def get_semantic_cache():
+    return SemanticCache(threshold=0.90)
+
+# -----------------------------------------------------------------------------
+# 3. High-Speed FastEmbed & Parallel Execution Worker Pool
 # -----------------------------------------------------------------------------
 
 @st.cache_resource
-def get_gemini_client(key):
-    return genai.Client(api_key=key) if key else None
-
-def scrape_url(url: str, timeout: int = 6) -> str:
-    """Scrapes clean text from a web page."""
-    try:
-        headers = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"}
-        response = requests.get(url, headers=headers, timeout=timeout)
-        if response.status_code == 200:
-            soup = BeautifulSoup(response.text, "html.parser")
-            for el in soup(["script", "style", "nav", "footer", "header", "aside"]):
-                el.extract()
-            text = soup.get_text(separator=" ")
-            clean_text = "\n".join(chunk.strip() for chunk in text.splitlines() if chunk.strip())
-            return clean_text[:4000]
-        return f"Error HTTP {response.status_code}"
-    except Exception as e:
-        return f"Failed to scrape: {e}"
-
-def search_web_multi(queries: list[str], max_results: int = 2) -> tuple[str, list[dict]]:
-    """Runs multiple web search queries."""
-    docs, metadata, seen = [], [], set()
-    ddgs = DDGS()
-    for q in queries:
-        try:
-            for r in ddgs.text(q, max_results=max_results):
-                href = r.get('href')
-                if href and href not in seen:
-                    seen.add(href)
-                    docs.append(f"[Web Source: {r.get('title')}]\nQuery: {q}\nSnippet: {r.get('body')}\nURL: {href}")
-                    metadata.append({"query": q, "title": r.get('title'), "url": href, "snippet": r.get('body')})
-        except Exception:
-            continue
-    return "\n\n---\n\n".join(docs), metadata
-
-def gemma_agent_router(client_genai, user_prompt: str, context_summary: str, tools_used: list[str]) -> dict:
-    """Uses Gemma model as the core Router Reasoning Engine."""
-    prompt = f"""You are an Autonomous AI Router Agent powered by Gemma for a Hyprland & Linux System Assistant.
-Your task is to analyze the user query and decide what tool to execute next.
-
-User Query: "{user_prompt}"
-Tools Executed So Far: {json.dumps(tools_used)}
-Current Summary of Gathered Information:
-"{context_summary if context_summary else 'No information gathered yet.'}"
-
-STRICT DECISION RULES:
-1. GREETINGS & SMALL TALK: If user says casual things ("selam", "hi", "merhaba", "eyvallah"), IMMEDIATELY choose "finish". Do not use any tools!
-2. LOCAL RAG: Choose "local_rag" if technical Hyprland/config details are needed and "local_rag" is NOT in Tools Executed.
-3. WEB SEARCH: Choose "web_search" ONLY if query needs live info, distros (CachyOS, Arch, etc.), or external tools not found locally.
-4. WEB SCRAPE: Choose "web_scrape" ONLY if a URL is explicitly provided in prompt or specific link reading is needed.
-5. FINISH: Choose "finish" if gathered info is sufficient to answer completely.
-
-Available actions: "local_rag", "web_search", "web_scrape", "finish"
-
-Output JSON matching schema:
-{{
-    "next_action": "local_rag" | "web_search" | "web_scrape" | "finish",
-    "reasoning": "Clear explanation of why this step was chosen",
-    "web_queries": ["query 1 in english", "query 2 in english"],
-    "scrape_urls": ["https://..."],
-    "expanded_terms": ["term1", "term2"]
-}}
-"""
-
-    try:
-        res = client_genai.models.generate_content(
-            model=GEN_MODEL,
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                temperature=0.0,
-                response_mime_type="application/json"
-            )
-        )
-        return json.loads(res.text)
-    except Exception as e:
-        return {"next_action": "finish", "reasoning": f"Gemma Router error ({e}). Proceeding to answer."}
+def get_fast_embedder():
+    # PyTorch yerine ONNX tabanlı hafif ve hızlı FastEmbed
+    return TextEmbedding(model_name=EMBED_MODEL_NAME)
 
 @st.cache_resource
-def load_embedder():
-    return SentenceTransformer(EMBED_MODEL_NAME)
+def get_worker_pool():
+    # CPU kilitlenmesini önlemek için maksimum 4 paralellik
+    return ThreadPoolExecutor(max_workers=4)
 
 @st.cache_data
 def load_data_and_cache():
@@ -203,7 +183,7 @@ def load_data_and_cache():
         return chunks
 
     if not os.path.exists(INPUT_PATH) or not os.path.exists(CACHE_PATH):
-        st.error(f"❌ Missing dataset files ('{INPUT_PATH}' or '{CACHE_PATH}')!")
+        st.error(f"❌ '{INPUT_PATH}' veya '{CACHE_PATH}' eksik!")
         st.stop()
 
     with open(INPUT_PATH, "r", encoding="utf-8") as f:
@@ -224,192 +204,259 @@ def load_data_and_cache():
 
     cache = np.load(CACHE_PATH, allow_pickle=True)
     embeddings = cache["embeddings"]
-
     return documents, embeddings
 
-# Initialize Backend
-if not API_KEY:
-    status_box.error("❌ GEMINI_API_KEY missing!")
-    st.error("🔑 Please set GEMINI_API_KEY in Streamlit Secrets or Environment.")
-    st.stop()
+# Initialize Global Architecture Components
+key_pool = get_global_key_pool()
+semantic_cache = get_semantic_cache()
+embedder = get_fast_embedder()
+worker_pool = get_worker_pool()
 
 try:
-    embedder = load_embedder()
     documents, embeddings = load_data_and_cache()
-    client = get_gemini_client(API_KEY)
-    status_box.success(f"✅ Gemma Agent Active! ({len(embeddings)} RAG vectors loaded)")
 except Exception as e:
-    status_box.error(f"Initialization Error: {e}")
+    st.error(f"Başlatma Hatası: {e}")
     st.stop()
 
-# Main Application UI
+# -----------------------------------------------------------------------------
+# Core Tools & Resilient Ajan Yönlendirici
+# -----------------------------------------------------------------------------
+
+def scrape_url(url: str, timeout: int = 5) -> str:
+    try:
+        headers = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64)"}
+        resp = requests.get(url, headers=headers, timeout=timeout)
+        if resp.status_code == 200:
+            soup = BeautifulSoup(resp.text, "html.parser")
+            for el in soup(["script", "style", "nav", "footer", "header", "aside"]):
+                el.extract()
+            text = soup.get_text(separator=" ")
+            return "\n".join(chunk.strip() for chunk in text.splitlines() if chunk.strip())[:3500]
+        return f"HTTP {resp.status_code}"
+    except Exception as e:
+        return f"Scrape error: {e}"
+
+def search_web_multi(queries: list[str], max_results: int = 2) -> tuple[str, list[dict]]:
+    docs, metadata, seen = [], [], set()
+    ddgs = DDGS()
+    for q in queries:
+        try:
+            for r in ddgs.text(q, max_results=max_results):
+                href = r.get('href')
+                if href and href not in seen:
+                    seen.add(href)
+                    docs.append(f"[Web Source: {r.get('title')}]\nSnippet: {r.get('body')}\nURL: {href}")
+                    metadata.append({"query": q, "title": r.get('title'), "url": href, "snippet": r.get('body')})
+        except Exception:
+            continue
+    return "\n\n---\n\n".join(docs), metadata
+
+def gemma_router_resilient(pool: GlobalKeyPool, user_prompt: str, context_summary: str, tools_used: list[str]) -> dict:
+    prompt = f"""You are an Autonomous AI Router Agent powered by Gemma for a Hyprland System Assistant.
+User Query: "{user_prompt}"
+Tools Executed: {json.dumps(tools_used)}
+Current Context Summary: "{context_summary}"
+
+RULES:
+1. GREETINGS ("selam", "hi", "merhaba"): Choose "finish" instantly.
+2. LOCAL RAG: Choose "local_rag" if Hyprland/Linux configs are needed and "local_rag" NOT in Tools Executed.
+3. WEB SEARCH: Choose "web_search" for external distros, live news, or non-Hyprland tools.
+4. WEB SCRAPE: Choose "web_scrape" if URL is in user prompt.
+5. FINISH: Choose "finish" if info is sufficient.
+
+Return JSON matching schema:
+{{
+    "next_action": "local_rag" | "web_search" | "web_scrape" | "finish",
+    "reasoning": "string",
+    "web_queries": ["query1"],
+    "scrape_urls": ["url1"],
+    "expanded_terms": ["term1"]
+}}"""
+
+    for _ in range(max(1, len(pool.keys))):
+        client = pool.get_client()
+        if not client:
+            break
+        try:
+            res = client.models.generate_content(
+                model=GEN_MODEL,
+                contents=prompt,
+                config=types.GenerateContentConfig(temperature=0.0, response_mime_type="application/json")
+            )
+            return json.loads(res.text)
+        except Exception as e:
+            err_msg = str(e).lower()
+            if any(term in err_msg for term in ["429", "resource_exhausted", "quota", "rate limit"]):
+                pool.rotate_on_limit()
+                continue
+            break
+    return {"next_action": "finish", "reasoning": "Direct fallback response."}
+
+# -----------------------------------------------------------------------------
+# UI & Session Management
+# -----------------------------------------------------------------------------
+
+if "chats" not in st.session_state:
+    st.session_state.chats = {}
+    default_id = str(uuid.uuid4())
+    st.session_state.chats[default_id] = {"title": "Yeni Oturum", "messages": []}
+    st.session_state.active_chat_id = default_id
+
+if "active_chat_id" not in st.session_state or st.session_state.active_chat_id not in st.session_state.chats:
+    st.session_state.active_chat_id = list(st.session_state.chats.keys())[0]
+
+with st.sidebar:
+    st.title("⚡ HyperAI Agent")
+    if st.button("➕ Yeni Sohbet", use_container_width=True):
+        new_id = str(uuid.uuid4())
+        st.session_state.chats[new_id] = {"title": f"Sohbet {len(st.session_state.chats) + 1}", "messages": []}
+        st.session_state.active_chat_id = new_id
+        st.rerun()
+
+    chat_options = {cid: data["title"] for cid, data in st.session_state.chats.items()}
+    chat_ids = list(chat_options.keys())
+    curr_idx = chat_ids.index(st.session_state.active_chat_id) if st.session_state.active_chat_id in chat_ids else 0
+
+    selected_chat_id = st.selectbox("Sohbet Geçmişi", options=chat_ids, format_func=lambda cid: chat_options[cid], index=curr_idx)
+    if selected_chat_id != st.session_state.active_chat_id:
+        st.session_state.active_chat_id = selected_chat_id
+        st.rerun()
+
+    st.markdown("---")
+    st.markdown("### 📊 Sistem & Sunucu Durumu")
+    st.info(key_pool.status_info)
+    st.caption(f"🚀 Önbellekteki Yanıt Sayısı: {len(semantic_cache.cache)}")
+
 st.markdown('<div class="main-header">HyperAI Agent</div>', unsafe_allow_html=True)
-st.markdown('<div class="sub-header">Gemma-4-31B Powered Autonomous ReAct Agent</div>', unsafe_allow_html=True)
+st.markdown('<div class="sub-header">50+ Kullanıcı Destekli Semantik Önbellekli RAG Mimarisi</div>', unsafe_allow_html=True)
 
 active_chat = st.session_state.chats[st.session_state.active_chat_id]
 
-# Render Chat History
+# Message History Render
 for msg in active_chat["messages"]:
     with st.chat_message(msg["role"]):
         st.markdown(msg["content"])
-        if "sources" in msg and msg["sources"]:
-            with st.expander("🔍 Used Retrieval Sources"):
-                for doc, score in msg["sources"]:
-                    tag = "📋 Table" if doc["is_table_row"] else "📄 Text"
-                    st.markdown(f"**{tag}** — `{doc['topic']}` *(Similarity: {score:.3f})*")
-                    st.code(doc["text"], language="markdown")
-        if "web_sources" in msg and msg["web_sources"]:
-            with st.expander("🌐 Web Research Sources"):
-                for meta in msg["web_sources"]:
-                    st.markdown(f"**[{meta['title']}]({meta['url']})** *(Query: `{meta['query']}`)*")
-                    st.caption(meta['snippet'])
+        if msg.get("from_cache"):
+            st.markdown('<span class="cache-badge">⚡ Önbellek Yanıtı (0 ms)</span>', unsafe_allow_html=True)
 
-# Chat Input Handler
-if user_prompt := st.chat_input("Ask a question, request a config, or paste a link..."):
+# User Input Handling
+if user_prompt := st.chat_input("Bir soru sorun veya Hyprland konfigürasyonu isteyin..."):
     if len(active_chat["messages"]) == 0:
-        active_chat["title"] = user_prompt[:25] + ("..." if len(user_prompt) > 25 else "")
+        active_chat["title"] = user_prompt[:25] + "..."
 
     active_chat["messages"].append({"role": "user", "content": user_prompt})
     with st.chat_message("user"):
         st.markdown(user_prompt)
 
     with st.chat_message("assistant"):
+        # FAST-PATH 1: Embedding Üretimi (FastEmbed - ONNX)
+        query_vec = list(embedder.embed([f"query: {user_prompt}"]))[0]
+
+        # FAST-PATH 2: Semantik Önbellek Kontrolü (0 ms)
+        cached_item, similarity = semantic_cache.search(query_vec)
+        if cached_item:
+            st.markdown(cached_item["response"])
+            st.markdown(f'<span class="cache-badge">⚡ Önbellekten Getirildi (%{similarity*100:.1f} Benzerlik)</span>', unsafe_allow_html=True)
+            active_chat["messages"].append({
+                "role": "assistant",
+                "content": cached_item["response"],
+                "from_cache": True
+            })
+            st.stop()
+
+        # FAST-PATH BİTTİ -> Ağır RAG & Ajan İşlemi
         rag_results = []
         web_context, web_metadata = "", []
-        scraped_context, scraped_metadata = "", []
-        
+        scraped_context = ""
         tools_executed = []
         context_accumulator = []
 
-        # Step-by-Step Gemma Reasoning Loop
-        with st.status("🧠 Gemma Reasoning Engine thinking...", expanded=True) as status:
-            max_steps = 3
-            for step in range(1, max_steps + 1):
+        with st.status("🧠 Gemma Ajanı Çalışıyor...", expanded=True) as status:
+            for step in range(1, 4):
                 summary_str = " | ".join(context_accumulator)[:1000]
-                decision = gemma_agent_router(client, user_prompt, summary_str, tools_executed)
-                
+                decision = gemma_router_resilient(key_pool, user_prompt, summary_str, tools_executed)
                 action = decision.get("next_action", "finish")
                 reasoning = decision.get("reasoning", "")
 
-                status.write(f"💭 **Gemma Step {step}:** *\"{reasoning}\"*")
+                status.write(f"💭 **Ajan Adımı {step}:** *\"{reasoning}\"*")
 
                 if action == "finish":
-                    status.write("✅ **Gemma Decision:** Sufficient reasoning completed. Generating response.")
                     break
 
-                # Tool 1: Local Vector RAG
                 elif action == "local_rag" and "local_rag" not in tools_executed:
                     tools_executed.append("local_rag")
-                    status.write("🔍 **Executing Tool:** Local Vector Dataset Search...")
+                    status.write("🔍 **Local RAG Vektör Araması Yapılıyor...**")
                     
-                    expanded_terms = decision.get("expanded_terms", [])
-                    q_text = "query: " + user_prompt + (" " + " ".join(expanded_terms) if expanded_terms else "")
-                    q_emb = embedder.encode([q_text], convert_to_numpy=True)[0]
-                    q_emb = q_emb / np.linalg.norm(q_emb)
-
-                    scores = embeddings @ q_emb
-                    keywords = set(re.findall(r'\b[a-zA-Z_]+\.[a-zA-Z_]+\b', user_prompt) + expanded_terms)
-                    
-                    exact_match_idx = []
-                    if keywords:
-                        for i, doc in enumerate(documents):
-                            if any(kw.lower() in doc["text"].lower() for kw in keywords):
-                                exact_match_idx.append(i)
-
-                    candidate_idx = exact_match_idx + [i for i in np.argsort(scores)[::-1] if i not in set(exact_match_idx)]
-                    final_idx = candidate_idx[:top_k_slider]
-
-                    rag_results = [(documents[i], scores[i]) for i in final_idx]
-                    status.write(f"   ↳ Retrived {len(rag_results)} local chunks.")
+                    q_norm = query_vec / np.linalg.norm(query_vec)
+                    scores = embeddings @ q_norm
+                    top_idx = np.argsort(scores)[::-1][:8]
+                    rag_results = [(documents[i], scores[i]) for i in top_idx]
                     context_accumulator.append(f"Local RAG found {len(rag_results)} docs.")
 
-                # Tool 2: Web Search
                 elif action == "web_search" and "web_search" not in tools_executed:
                     tools_executed.append("web_search")
                     queries = decision.get("web_queries", [user_prompt])
-                    status.write(f"🌐 **Executing Tool:** Dynamic Web Search ({len(queries)} queries)...")
-                    for q in queries:
-                        status.write(f"   ↳ 🔎 Search: `{q}`")
-                    
+                    status.write(f"🌐 **Web Araması Yapılıyor:** `{queries[0]}`")
                     web_context, web_metadata = search_web_multi(queries)
-                    status.write(f"   ↳ Found {len(web_metadata)} live web snippets.")
                     context_accumulator.append(f"Web Search found {len(web_metadata)} snippets.")
 
-                # Tool 3: Web Scrape
                 elif action == "web_scrape" and "web_scrape" not in tools_executed:
                     tools_executed.append("web_scrape")
                     scrape_urls = decision.get("scrape_urls", [])
-                    status.write(f"🕷️ **Executing Tool:** Web Scraping ({len(scrape_urls)} URLs)...")
-                    for u in scrape_urls:
-                        content = scrape_url(u)
-                        if content and not content.startswith("Error"):
-                            scraped_context += f"\n[Scraped: {u}]\n{content}\n"
-                            scraped_metadata.append({"url": u, "length": len(content), "snippet": content[:200] + "..."})
-                    status.write(f"   ↳ Extracted content from {len(scraped_metadata)} pages.")
-                    context_accumulator.append(f"Scraped {len(scraped_metadata)} web pages.")
+                    if scrape_urls:
+                        scraped_context = scrape_url(scrape_urls[0])
+                        context_accumulator.append("URL scraped.")
 
-            status.update(label="🚀 Synthesizing final answer...", state="complete", expanded=False)
+            status.update(label="🚀 Yanıt Sentezleniyor...", state="complete", expanded=False)
 
-        # Build Combined Context
+        # Full Context Construction
         full_context = ""
         if rag_results:
             full_context += "### Local RAG Context:\n" + "\n\n".join([f"[{d['topic']}]\n{d['text']}" for d, _ in rag_results])
         if web_context:
-            full_context += "\n\n### Web Search Context:\n" + web_context
+            full_context += "\n\n### Web Context:\n" + web_context
         if scraped_context:
-            full_context += "\n\n### Scraped Web Content:\n" + scraped_context
+            full_context += "\n\n### Scraped Context:\n" + scraped_context
 
-        history_text = ""
-        for m in active_chat["messages"][-6:-1]:
-            role_name = "User" if m["role"] == "user" else "Assistant"
-            history_text += f"{role_name}: {m['content']}\n"
+        system_prompt = f"""You are HyperAI, an expert Hyprland & Linux system assistant.
+Answer the user's question clearly and concisely.
 
-        system_prompt = f"""You are HyperAI, an expert system engineer and Hyprland assistant.
-
-Gathered Context:
+Context:
 {full_context if full_context else "No external context used."}
 
-Recent Conversation History:
-{history_text}
-
-User Query:
-{user_prompt}
-
-Instructions:
-1. If user query is a casual greeting, respond naturally without technical jargon.
-2. For technical requests, leverage context to provide precise answers and config blocks.
+User Query: {user_prompt}
 """
 
-        def stream_generator():
-            stream = client.models.generate_content_stream(
-                model=GEN_MODEL,
-                contents=system_prompt,
-                config=types.GenerateContentConfig(temperature=temp_slider)
-            )
-            for chunk in stream:
-                if chunk.text:
-                    yield chunk.text
+        # Resilient Multi-Key Streamer
+        def stream_response():
+            for _ in range(max(1, len(key_pool.keys))):
+                client = key_pool.get_client()
+                try:
+                    stream = client.models.generate_content_stream(
+                        model=GEN_MODEL,
+                        contents=system_prompt,
+                        config=types.GenerateContentConfig(temperature=0.3)
+                    )
+                    for chunk in stream:
+                        if chunk.text:
+                            yield chunk.text
+                    return
+                except Exception as e:
+                    err_msg = str(e).lower()
+                    if any(term in err_msg for term in ["429", "resource_exhausted", "quota", "rate limit"]):
+                        key_pool.rotate_on_limit()
+                        continue
+                    yield f"❌ Hata: {e}"
+                    break
 
-        try:
-            full_response = st.write_stream(stream_generator())
+        full_response = st.write_stream(stream_response())
 
-            if rag_results:
-                with st.expander("🔍 Used Retrieval Sources"):
-                    for doc, score in rag_results:
-                        st.markdown(f"**{doc['topic']}** *(Score: {score:.3f})*")
-                        st.code(doc["text"], language="markdown")
+        # Cevabı Semantik Önbelleğe Kaydet (Gelecek Kullanıcılar İçin)
+        if full_response and len(full_response) > 20:
+            semantic_cache.add(query_vec, full_response, rag_results)
 
-            if web_metadata:
-                with st.expander("🌐 Web Research Sources"):
-                    for meta in web_metadata:
-                        st.markdown(f"**[{meta['title']}]({meta['url']})** *(Query: `{meta['query']}`)*")
-
-            active_chat["messages"].append({
-                "role": "assistant",
-                "content": full_response,
-                "sources": rag_results,
-                "web_sources": web_metadata
-            })
-
-        except Exception as e:
-            st.error(f"❌ Response Generation Error: {e}")
+        active_chat["messages"].append({
+            "role": "assistant",
+            "content": full_response,
+            "from_cache": False
+        })
