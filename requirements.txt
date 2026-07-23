@@ -4,3 +4,5 @@ google-genai
 numpy
 groq
 ddgs
+requests
+beautifulsoup4
